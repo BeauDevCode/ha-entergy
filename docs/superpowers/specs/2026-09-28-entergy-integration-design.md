@@ -159,10 +159,11 @@ each hop must be explicitly reviewed and allowlisted, with HTTPS, the exact
 approved host, port 443, no user information, no fragment, no alternate host or
 IP, no downgrade, and at most one hop. URLs returned in JSON are never followed.
 
-The selected account identifier is encoded as one path segment. Control
-characters and path traversal are rejected. Normal certificate and hostname
-validation remain enabled. The integration offers no insecure TLS switch and
-does not add brittle certificate pinning.
+The selected account identifier must be 1–128 ASCII unreserved characters
+(`[A-Za-z0-9._~-]`), must not contain `..`, and is encoded as one path segment.
+Control characters and path traversal are rejected. Normal certificate and
+hostname validation remain enabled. The integration offers no insecure TLS
+switch and does not add brittle certificate pinning.
 
 The complete V1 allowlist is:
 
@@ -182,8 +183,10 @@ timeout. Each response is limited to 2 MiB after decompression and each weekly
 page to 512 normalized intervals. A normal reconciliation may fetch at most
 seven weekly pages and one request chain may make at most 12 HTTP requests,
 including initialization, login, and account verification. `Retry-After` is
-accepted only as a non-negative delay and clamped to 24 hours. Exceeding any
-limit preserves the last known-good state and raises a sanitized error.
+accepted in either HTTP delta-seconds or HTTP-date form, converted to a
+non-negative delay, and clamped to 24 hours. Invalid values fall back to the
+normal exponential schedule. Exceeding any limit preserves the last known-good
+state and raises a sanitized error.
 
 Responses require an accepted JSON content type and a reviewed schema. Retry
 behavior applies only to retryable operations and never changes the
@@ -208,9 +211,12 @@ Diagnostics are built from an allowlist:
 Diagnostics never serialize config-entry data, raw coordinator or API data,
 exception strings, headers, or URLs.
 
-Account choices display only `Account ending ••••1234` and an optional
-non-address nickname. The full account identifier is retained only in the
-private config entry for API calls.
+Account choices display only `Account ending ••••1234` and an optional safe
+nickname. A nickname is shown only from the reviewed `nickname`/`name` fields,
+after trimming, when it is 1–40 characters and contains no digit, line break,
+comma, or `@`; otherwise it is omitted as potentially identifying/address-like.
+The full account identifier is retained only in the private config entry for
+API calls.
 
 ## Pseudonymous identifiers
 
@@ -224,8 +230,12 @@ substitute.
 
 Duplicate setup is prevented by comparing the selected raw account identifier
 to existing private entries. Migrations create the `public_id` before registry
-or statistic changes and preserve existing entity IDs where Home Assistant
-allows it.
+or statistic changes. Existing entity IDs are preserved only when they do not
+contain the raw or Home Assistant-slugified username/account identifier;
+privacy wins over identifier stability. When PII-freedom cannot be proved, the
+integration renames every entity attached to the legacy PII-bearing device. A
+supported entity-registry rename and a repair warning document any automation
+impact when an entity ID must change.
 
 ## Canonical interval model
 
@@ -239,10 +249,30 @@ Each normalized record contains:
 - receipt time; and
 - source revision or a deterministic fingerprint.
 
+The source fingerprint includes only stable source-derived fields: start, end,
+import, return, amount, currency, estimated status, and optional source
+revision. It explicitly excludes receipt time, account data, fetch time, and
+all runtime metadata so a refetch of unchanged data remains idempotent.
+
+The reviewed compatibility schema accepts client metadata from `clientId` at
+the root or in `data`; login tokens from `accessToken`, `access_token`, or
+`token` at the root or in `data`; and challenges from `nextAction` at either
+location. Account lists may be a root list or one of `accounts`, `data`,
+`items`, or `results`; identifiers may use the known upstream aliases, while
+only `nickname` or `name` can supply an optional display nickname. Service
+addresses are never displayed. Usage must be found at
+`data.daily.electric[].hourly[]` with `date`, finite `usage`, optional finite
+`cost`, and boolean `isEstimated` fields.
+
 The parser rejects naive or invalid timestamps, non-finite numbers, negative
 import/export values, `end <= start`, conflicting overlapping records, and
 implausible durations or energy. Missing intervals remain missing; the
 integration does not invent usage.
+
+V1 usage records represent exactly one absolute UTC hour. The parser rejects
+more than 10,000 kWh of import or return in one interval and monetary amounts
+whose absolute value exceeds USD 1,000,000. These are defensive payload limits,
+not claims about a customer's service capacity.
 
 The account or service IANA timezone is used when supplied. Otherwise setup
 requires a timezone option defaulting to Home Assistant's timezone. Calendar
@@ -272,21 +302,35 @@ schema and no direct `.storage` file access. Schema version 2 stores:
   before the retained window;
 - the historical backfill cursor;
 - the earliest hour awaiting statistics reconciliation; and
-- the last successfully imported statistics fingerprint.
+- the last Recorder-verified statistics fingerprint.
 
-All changes are copy-on-write. The integration validates a complete candidate
-snapshot, writes it with `Store.async_save`, and swaps it into memory only after
-the save succeeds. Statistics are written after the ledger snapshot; if that
-step fails, the persisted pending-hour marker causes an idempotent retry.
-Home Assistant owns atomic replacement and file permissions. The integration
-does not change permissions or write temporary files itself.
+The `Store` is created with `private=True` and `atomic_writes=True`. All changes
+are copy-on-write. Because `Store.async_save()` logs some write failures instead
+of returning a success value, the integration saves the complete candidate,
+reloads it through the public `Store.async_load()` API, compares its canonical
+fingerprint, and swaps it into memory only after that verification. Statistics
+are queued after the verified ledger snapshot; the persisted pending-hour
+marker and rolling overlap make retries idempotent. Home Assistant owns atomic
+replacement and file permissions. The integration does not change permissions
+or write temporary files itself.
 
-Every schema change has an explicit, tested migration. A missing store starts a
-new ledger. An unreadable, corrupt, or future-version store is never treated as
-empty or overwritten: setup stops data import, preserves the file, and creates
-a repair issue with secret-free recovery instructions. Tests cover a crash or
-exception during save, a failed statistics import after save, corrupt JSON, and
-unsupported schema versions.
+Home Assistant defers Store writes while Core is stopping and may return the
+pending in-memory candidate from an immediate load. The ledger therefore checks
+Core state before saving and again after readback; if Core is stopping or enters
+final-write shutdown, it defers the mutation, keeps the prior in-memory state,
+and queues no Recorder work.
+
+Every schema change has an explicit, tested migration. The config entry records
+`ledger_initialized=true` only after the first verified save. A `None` load is
+new state only while that marker is absent; if the marker exists, setup blocks
+instead of rebuilding empty. This supported marker is necessary because Home
+Assistant may rename corrupt Store JSON and return the same `None` value as a
+missing file. An unreadable, corrupt, missing-after-initialization, or
+future-version store is never overwritten: setup stops data import, preserves
+Home Assistant's recovered file where available, and creates a repair issue
+with secret-free recovery instructions. Tests cover a logged/hidden save
+failure, failed read-back verification, a failed statistics queue after save,
+corrupt JSON, missing initialized storage, and unsupported schema versions.
 
 ## Backfill, reconciliation, and retention
 
@@ -317,23 +361,37 @@ statistic-scoped Recorder operation. Regression tests prove that a missing or
 retracted interval neither leaves a silently altered cumulative series nor
 invents zero usage.
 
+V1 recognizes no deletion field in the reviewed source schema; any apparent
+deletion/retraction marker is therefore schema drift and quarantined. A mass
+change is suspicious when at least 24 known intervals overlap, more than 75
+percent change fingerprint in one response, and the absolute aggregate energy
+delta exceeds 25 percent of the prior overlap. All three conditions are
+required so a normal estimated-to-actual update does not trigger on count alone.
+
 ## Home Assistant Recorder and Energy dashboard
 
 The primary measurements are Recorder external statistics rather than
 synthetic `total_increasing` sensor state:
 
 - `entergy_mobile:<public_id>_consumption`;
-- `entergy_mobile:<public_id>_return`; and
+- `entergy_mobile:<public_id>_return`;
 - `entergy_mobile:<public_id>_cost` when validated charges are present; and
 - `entergy_mobile:<public_id>_compensation` when validated credits are present.
 
 The implementation uses Home Assistant's supported
 `async_add_external_statistics` API, whose same-timestamp behavior updates an
-existing hour. Metadata uses the component domain as its source, current unit
-classes, kWh or the validated Home Assistant currency unit, and
-`StatisticMeanType.NONE` for compatibility with the tightened statistics API.
-Every hourly item has `state` equal to that hour's value and `sum` equal to the
-correction-aware cumulative value. Cost and compensation are separate,
+existing hour. The API queues Recorder work and returns no commit confirmation,
+so successful return means **queued**, not durably committed. The ledger keeps
+a rolling, idempotent overlap and a pending marker so a restart safely queues
+the same correction suffix again.
+
+Metadata uses the component domain as its source,
+`StatisticMeanType.NONE`, `has_sum=True`, and `EnergyConverter.UNIT_CLASS` with
+kWh for energy. Following Home Assistant's current Opower implementation,
+monetary metadata uses `unit_class=None` and `unit_of_measurement=None`; the
+separate source/Home Assistant USD validation still controls whether it is
+queued. Every hourly item has `state` equal to that hour's value and `sum` equal
+to the correction-aware cumulative value. Cost and compensation are separate,
 non-negative cumulative series.
 
 Normal entities provide freshness and rolling summaries without pretending to
@@ -348,6 +406,11 @@ with 0–10 percent jitter. The client respects `Retry-After` and uses transient
 backoff of one, two, four, eight, then at most 24 hours. Success resets backoff.
 Only one request chain runs at a time.
 
+Data freshness is based on the newest utility interval, not the fetch time:
+`fresh` is at most 36 hours old, `delayed` is over 36 through 72 hours, `stale`
+is over 72 hours, and `unknown` means no valid interval exists. Last successful
+fetch is shown separately.
+
 Failure handling is explicit:
 
 - 401/403: one login attempt, then reauthentication;
@@ -357,6 +420,20 @@ Failure handling is explicit:
 - invalid credentials or authentication challenge: stop and require local user
   action; and
 - disabled or unloaded entry: make no requests.
+
+Stable repair issue IDs contain only the random public ID:
+`ledger_corrupt_<public_id>`, `ledger_future_<public_id>`,
+`schema_drift_<public_id>`, `currency_mismatch_<public_id>`,
+`data_retraction_<public_id>`, `legacy_energy_source_<public_id>`,
+`legacy_entity_id_<public_id>`, and `backfill_stalled_<public_id>`. Issue titles
+and placeholders are localized and never include remote payload or account
+data.
+
+Ledger corruption/future versions, schema drift, and data retraction use
+`ERROR`; currency mismatch, legacy Energy-source/entity-ID replacement, and a
+backfill that makes no cursor progress for 24 hours while
+authentication/network health remain good use `WARNING`. No integration
+condition uses `CRITICAL`.
 
 ## Test strategy
 
@@ -392,16 +469,25 @@ logs or diagnostics.
 CI uses least-privilege permissions and pins third-party actions to commit SHAs.
 Required jobs include Ruff/format, mypy, pytest on the supported minimum and
 current stable Home Assistant versions, hassfest, HACS validation, dependency
-audit, CodeQL, and secret scanning. Coverage targets are at least 90 percent for
-security/data modules and 85 percent overall. Dependency bots may open
-reviewable pull requests but never auto-merge them.
+audit, CodeQL, and secret scanning. Coverage targets are 100 percent for the
+transport, authentication, parsing, ledger, statistics, and redaction modules
+and at least 95 percent overall. Dependency bots may open reviewable pull
+requests but never auto-merge them.
+
+The supported floor is Home Assistant 2026.9.3 on Python 3.14. CI also tests
+Home Assistant 2026.9.4, the current stable version at this design checkpoint.
+The manifest has no added runtime dependencies unless a later reviewed change
+proves one necessary.
 
 Releases use semantic versions and protected tags only after required review
-and CI. Release notes identify supported Home Assistant versions, the upstream
-base, migrations, and known source limitations. A release publishes immutable
-source plus SHA-256; provenance and an SBOM are added if dependencies are
-introduced. Install instructions never point production systems at a moving
-branch.
+and CI. The first hardened candidate is `1.0.0-rc.1`. Release notes identify
+supported Home Assistant versions, the upstream base, migrations, and known
+source limitations. The release asset is
+`ha-entergy-1.0.0-rc.1.zip`, containing `custom_components/entergy_mobile/` at
+its root, with `ha-entergy-1.0.0-rc.1.zip.sha256` in standard
+`<hash><two spaces><filename>` form. GitHub artifact attestation is published;
+an SPDX JSON SBOM is also published if runtime dependencies are introduced.
+Install instructions never point production systems at a moving branch.
 
 ## Installation, updates, and rollback
 
