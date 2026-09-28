@@ -16,12 +16,7 @@ DEFAULT_SCAN_INTERVAL_SECONDS: Final = 3600
 MIN_SCAN_INTERVAL_SECONDS: Final = 60
 MAX_SCAN_INTERVAL_SECONDS: Final = 86400
 
-BASE_URL: Final = "https://prod.entergy.mindgrb.io/api"
-APP_CONFIG_URL: Final = f"{BASE_URL}/app"
-LOGIN_URL: Final = f"{BASE_URL}/login"
-LOGOUT_URL: Final = f"{BASE_URL}/logout"
-ACCOUNTS_URL: Final = f"{BASE_URL}/accounts"
-WEEKLY_USAGE_URL: Final = f"{BASE_URL}/accounts/{{account_id}}/weeklyusage"
+API_ORIGIN: Final = "https://prod.entergy.mindgrb.io"
 
 STORAGE_VERSION: Final = 1
 STORAGE_KEY_PREFIX: Final = "entergy_mobile_usage"
