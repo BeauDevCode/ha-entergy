@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import traceback
 from datetime import UTC, date, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from custom_components.entergy_mobile import api
 from custom_components.entergy_mobile.errors import (
     AuthError,
@@ -20,6 +25,7 @@ from custom_components.entergy_mobile.errors import (
     RateLimitError,
 )
 from custom_components.entergy_mobile.models import Credentials
+from yarl import URL
 
 
 class FakeResponse:
@@ -321,3 +327,97 @@ async def test_session_value_error_is_sanitized(caplog: Any) -> None:
         await authenticated(session).async_get_accounts(api.RequestBudget())
     assert caught.value.category == ErrorCategory.TRANSIENT
     assert "secret-header" not in str(caught.value) + repr(caught.value) + caplog.text
+
+
+async def test_real_aiohttp_implicit_retry_cannot_send_request_thirteen(
+    monkeypatch: Any, socket_enabled: None
+) -> None:
+    received = 0
+    middleware_calls = 0
+
+    async def handler(_: web.Request) -> web.Response:
+        nonlocal received
+        received += 1
+        return web.json_response({"accounts": []})
+
+    async def existing_middleware(
+        request: aiohttp.ClientRequest,
+        next_handler: Any,
+    ) -> aiohttp.ClientResponse:
+        nonlocal middleware_calls
+        middleware_calls += 1
+        response = await next_handler(request)
+        if middleware_calls == 12:
+            response.close()
+            raise aiohttp.ServerDisconnectedError()
+        return response
+
+    app = web.Application()
+    app.router.add_get("/api/accounts", handler)
+    async with TestServer(app) as server:
+        monkeypatch.setattr(api, "API_ORIGIN", str(server.make_url("/")).rstrip("/"))
+        async with aiohttp.ClientSession(middlewares=(existing_middleware,)) as session:
+            subject = authenticated(session)
+            budget = api.RequestBudget()
+            for _ in range(11):
+                await subject.async_get_accounts(budget)
+            with pytest.raises(PolicyError):
+                await subject.async_get_accounts(budget)
+            assert received == 12
+            assert middleware_calls == 13
+            assert budget.used == 12
+
+
+async def test_dot_account_is_rejected_before_actual_yarl_path_normalization() -> None:
+    assert URL("https://prod.entergy.mindgrb.io/api/accounts/.").path == "/api/accounts/"
+    session = FakeSession()
+    with pytest.raises(PolicyError):
+        await authenticated(session).async_get_account(".", api.RequestBudget())
+    assert session.calls == []
+
+
+async def test_remote_timezone_parser_value_error_is_sanitized(caplog: Any) -> None:
+    sentinel = "secret-zone-987654"
+    session = FakeSession(
+        FakeResponse({"accounts": [{"accountId": "valid", "timeZone": "../" + sentinel}]})
+    )
+    with pytest.raises(PayloadError) as caught:
+        await authenticated(session).async_get_accounts(api.RequestBudget())
+    exposed = "".join(traceback.format_exception(caught.value)) + repr(caught.value) + caplog.text
+    assert sentinel not in exposed
+
+
+async def test_real_gzip_decoded_limit_releases_response_without_leak(
+    monkeypatch: Any, caplog: Any, socket_enabled: None
+) -> None:
+    sentinel = "secret-gzip-body-987654"
+    decoded = (sentinel * 140000).encode()
+    compressed = gzip.compress(decoded)
+    assert len(compressed) < 2 * 1024 * 1024 < len(decoded)
+    responses: list[aiohttp.ClientResponse] = []
+    trace = aiohttp.TraceConfig()
+
+    async def saw_response(_: Any, __: Any, params: Any) -> None:
+        responses.append(params.response)
+
+    trace.on_request_end.append(saw_response)
+
+    async def handler(_: web.Request) -> web.Response:
+        return web.Response(
+            body=compressed,
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        )
+
+    app = web.Application()
+    app.router.add_get("/api/accounts", handler)
+    async with TestServer(app) as server:
+        monkeypatch.setattr(api, "API_ORIGIN", str(server.make_url("/")).rstrip("/"))
+        async with aiohttp.ClientSession(trace_configs=(trace,)) as session:
+            with pytest.raises(PayloadError) as caught:
+                await authenticated(session).async_get_accounts(api.RequestBudget())
+            assert len(responses) == 1
+            assert responses[0].closed
+            exposed = (
+                "".join(traceback.format_exception(caught.value)) + repr(caught.value) + caplog.text
+            )
+            assert sentinel not in exposed

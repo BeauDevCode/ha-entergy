@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -140,6 +141,7 @@ class EntergyApiClient:
                 not isinstance(account_id, str)
                 or not _ACCOUNT_SEGMENT.fullmatch(account_id)
                 or ".." in account_id
+                or account_id == "."
             ):
                 raise PolicyError from None
         elif account_id is not None:
@@ -165,6 +167,21 @@ class EntergyApiClient:
         if operation is ApiOperation.LOGIN:
             headers["Content-Type"] = "application/json"
         budget.consume()
+        attempts = 0
+
+        async def count_attempt(
+            request: aiohttp.ClientRequest,
+            handler: Callable[[aiohttp.ClientRequest], Awaitable[aiohttp.ClientResponse]],
+        ) -> aiohttp.ClientResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                budget.consume()
+            return await handler(request)
+
+        # aiohttp per-request middleware replaces the session list, so compose explicitly.
+        # Placing this innermost counts retries made by session middleware too.
+        session_middlewares = getattr(self._session, "_middlewares", ()) or ()
         try:
             async with self._session.request(
                 method,
@@ -180,6 +197,7 @@ class EntergyApiClient:
                 timeout=_TIMEOUT,
                 allow_redirects=False,
                 auto_decompress=True,
+                middlewares=(*session_middlewares, count_attempt),
             ) as response:
                 status = response.status
                 if 300 <= status < 400:
@@ -214,7 +232,7 @@ class EntergyApiClient:
     async def async_initialize(self, budget: RequestBudget | None = None) -> ClientMetadata:
         """Load client metadata through the bounded transport."""
         payload = await self._request_json(ApiOperation.APP, self._budget(budget))
-        result = parse_client_metadata(payload)
+        result = _parse_reviewed(lambda: parse_client_metadata(payload))
         self._client_id = result.client_id
         return result
 
@@ -224,7 +242,7 @@ class EntergyApiClient:
         if self._client_id is None:
             await self.async_initialize(chain)
         payload = await self._request_json(ApiOperation.LOGIN, chain)
-        result = parse_login(payload)
+        result = _parse_reviewed(lambda: parse_login(payload))
         self._access_token = result.access_token
         return result
 
@@ -244,7 +262,7 @@ class EntergyApiClient:
     ) -> tuple[Account, ...] | object:
         """List strictly parsed accounts (legacy constructor returns raw payload)."""
         payload = await self._request_json(ApiOperation.ACCOUNTS, self._budget(budget))
-        accounts = parse_accounts(payload)
+        accounts = _parse_reviewed(lambda: parse_accounts(payload))
         self._account_zones.update(
             {account.account_id: account.time_zone for account in accounts if account.time_zone}
         )
@@ -257,7 +275,7 @@ class EntergyApiClient:
         payload = await self._request_json(
             ApiOperation.ACCOUNT, self._budget(budget), account_id=account_id
         )
-        account = parse_account(payload, account_id)
+        account = _parse_reviewed(lambda: parse_account(payload, account_id))
         if account.time_zone:
             self._account_zones[account_id] = account.time_zone
         return payload if self._legacy_raw else account
@@ -272,10 +290,12 @@ class EntergyApiClient:
             account_id=account_id,
             start_date=start_date,
         )
-        intervals = parse_usage(
-            payload,
-            source_time_zone=self._account_zones.get(account_id, "America/Chicago"),
-            received_at=datetime.now(UTC),
+        intervals = _parse_reviewed(
+            lambda: parse_usage(
+                payload,
+                source_time_zone=self._account_zones.get(account_id, "America/Chicago"),
+                received_at=datetime.now(UTC),
+            )
         )
         if len(intervals) > 512:
             raise PayloadError from None
@@ -288,6 +308,16 @@ class EntergyApiClient:
         return await self.async_get_weekly_usage(
             account_id, date.today() - timedelta(days=6), self._budget(budget)
         )
+
+
+def _parse_reviewed[T](parser: Callable[[], T]) -> T:
+    """Keep unanticipated data-derived parser failures value-free at the API edge."""
+    try:
+        return parser()
+    except EntergyError:
+        raise
+    except Exception:
+        raise PayloadError from None
 
 
 def _retry_after(value: str | None) -> float | None:
