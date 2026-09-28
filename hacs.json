@@ -1,4 +1,5 @@
 {
-  "name": "Entergy",
-  "country": "US"
+  "name": "Entergy Usage (Unofficial Hardened Fork)",
+  "country": "US",
+  "homeassistant": "2026.9.3"
 }
