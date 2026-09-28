@@ -3,7 +3,7 @@
 import json
 import traceback
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -183,3 +183,33 @@ def test_foreign_currency_preserves_energy_without_usd_monetary_summary() -> Non
     assert snapshot.latest_import_kwh == Decimal("2")
     assert snapshot.latest_cost is None
     assert snapshot.latest_compensation is None
+
+
+def test_usage_preserves_high_precision_and_tiny_finite_values() -> None:
+    precise = "1.0000000000000000000000000001"
+    tiny = "1e-1000000"
+    with localcontext() as context:
+        context.prec = 5
+        items = parse(
+            usage(
+                record("2026-09-27T10:00:00Z", precise),
+                record("2026-09-27T11:00:00Z", "-" + precise),
+                record("2026-09-27T12:00:00Z", tiny),
+            )
+        )
+    assert items[0].import_kwh == Decimal(precise)
+    assert items[1].return_kwh == Decimal(precise)
+    assert items[2].import_kwh == Decimal(tiny)
+    assert items[2].import_kwh != 0
+    ordinary = parse(usage(record("2026-09-27T10:00:00Z", 1)))[0]
+    assert items[0].fingerprint != ordinary.fingerprint
+
+
+@pytest.mark.parametrize("field", ["usage", "cost"])
+def test_extreme_finite_magnitude_has_safe_payload_error(field: str) -> None:
+    rejected = "1e1000000"
+    hourly = record("2026-09-27T10:00:00Z", 1)
+    hourly[field] = rejected
+    with pytest.raises(PayloadError) as caught:
+        parse(usage(hourly))
+    assert rejected not in "".join(traceback.format_exception(caught.value))

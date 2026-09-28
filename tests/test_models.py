@@ -2,7 +2,7 @@
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from custom_components.entergy_mobile.errors import (
@@ -105,6 +105,34 @@ def test_direct_interval_requires_utc_hour_boundary() -> None:
             is_estimated=False,
             received_at=datetime(2026, 9, 28, tzinfo=UTC),
         )
+
+
+def test_fingerprint_keeps_finite_digits_independent_of_decimal_context() -> None:
+    start = datetime(2026, 9, 27, 10, tzinfo=UTC)
+
+    def fingerprint(energy: Decimal) -> str:
+        return EnergyInterval(
+            start=start,
+            end=start + timedelta(hours=1),
+            import_kwh=energy,
+            return_kwh=Decimal(0),
+            amount=Decimal("0.20"),
+            currency="USD",
+            is_estimated=False,
+            received_at=datetime(2026, 9, 28, tzinfo=UTC),
+        ).fingerprint
+
+    precise = Decimal("1.0000000000000000000000000001")
+    tiny = Decimal("1e-1000000")
+    with localcontext() as context:
+        context.prec = 5
+        low_precision = fingerprint(precise)
+        tiny_fingerprint = fingerprint(tiny)
+    with localcontext() as context:
+        context.prec = 50
+        assert fingerprint(precise) == low_precision
+    assert low_precision != fingerprint(Decimal(1))
+    assert tiny_fingerprint != fingerprint(Decimal(0))
 
 
 def test_errors_never_echo_sensitive_values() -> None:

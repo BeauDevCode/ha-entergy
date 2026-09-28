@@ -10,7 +10,17 @@ from hashlib import sha256
 
 
 def _canonical_decimal(value: Decimal) -> str:
-    return "0" if value.is_zero() else str(value.normalize())
+    """Encode a finite number by coefficient and exponent without active context."""
+    if value.is_zero():
+        return "0"
+    parts = value.as_tuple()
+    digits = list(parts.digits)
+    exponent = parts.exponent
+    assert isinstance(exponent, int)
+    while digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    return f"{parts.sign}:{''.join(str(digit) for digit in digits)}:{exponent}"
 
 
 @dataclass(frozen=True, slots=True, repr=False)

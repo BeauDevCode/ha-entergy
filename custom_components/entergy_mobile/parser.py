@@ -215,11 +215,11 @@ def _decimal(value: object) -> Decimal:
         raise PayloadError
     try:
         result = Decimal(str(value))
-    except InvalidOperation:
+    except (InvalidOperation, ValueError, OverflowError):
         raise PayloadError from None
     if not result.is_finite():
         raise PayloadError
-    return Decimal(0) if result.is_zero() else result.normalize()
+    return Decimal(0) if result.is_zero() else result
 
 
 def _pick_string(payload: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
@@ -328,10 +328,10 @@ def parse_usage(
             hour = _object(raw)
             start = _timestamp(hour.get("date"))
             signed_usage = _decimal(hour.get("usage"))
-            if abs(signed_usage) > _MAX_KWH:
+            if signed_usage.copy_abs() > _MAX_KWH:
                 raise PayloadError
             amount = _decimal(hour["cost"]) if "cost" in hour and hour["cost"] is not None else None
-            if amount is not None and abs(amount) > _MAX_AMOUNT:
+            if amount is not None and amount.copy_abs() > _MAX_AMOUNT:
                 raise PayloadError
             estimated = hour.get("isEstimated")
             if not isinstance(estimated, bool):
@@ -346,8 +346,8 @@ def parse_usage(
             interval = EnergyInterval(
                 start=start,
                 end=start + _HOUR,
-                import_kwh=max(signed_usage, Decimal(0)),
-                return_kwh=max(-signed_usage, Decimal(0)),
+                import_kwh=signed_usage if signed_usage > 0 else Decimal(0),
+                return_kwh=signed_usage.copy_negate() if signed_usage < 0 else Decimal(0),
                 amount=amount,
                 currency=currency,
                 is_estimated=estimated,
