@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Entergy Login",
-        "description": "Enter your Entergy credentials.",
+        "description": "Your username and password are stored in Home Assistant configuration to reconnect after a restart. Enter them only through your trusted local Home Assistant connection.",
         "data": {
           "username": "Username",
           "password": "Password",
@@ -17,6 +17,15 @@
         "data": {
           "account_id": "Account"
         }
+      },
+      "reauth_confirm": {
+        "title": "Sign in again",
+        "description": "Your username and password are stored in Home Assistant configuration to reconnect after a restart. Enter them only through your trusted local Home Assistant connection. Sign in to the same Entergy account.",
+        "data": {
+          "username": "Username",
+          "password": "Password",
+          "language": "Language"
+        }
       }
     },
     "error": {
@@ -24,7 +33,14 @@
       "invalid_auth": "Invalid username or password.",
       "mfa_required": "Entergy requested an additional login step that this integration does not support yet.",
       "no_accounts": "Login worked, but no accounts were returned.",
-      "unknown": "Unexpected error."
+      "unknown": "Unexpected error.",
+      "unsupported_challenge": "Entergy requires an interactive login step that this integration cannot complete. Keep your account security enabled."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "unique_id_mismatch": "The authenticated account does not match this entry.",
+      "reauth_successful": "Credentials updated successfully.",
+      "invalid_account": "Select an account returned by this sign-in."
     }
   },
   "options": {
@@ -36,6 +52,20 @@
           "scan_interval_seconds": "Data update interval in seconds"
         }
       }
+    }
+  },
+  "issues": {
+    "legacy_entity_id": {
+      "title": "Entity IDs changed for privacy",
+      "description": "Legacy entity IDs were renamed to remove personal information. Update automations, scripts, and dashboards that referenced them."
+    },
+    "legacy_energy_source": {
+      "title": "Update Energy dashboard sources",
+      "description": "Legacy total sensors have been disabled. Select the new Entergy statistics sources in the Energy dashboard. Historical legacy data has not been deleted."
+    },
+    "ledger_repair": {
+      "title": "Usage ledger needs repair",
+      "description": "Migration could not verify local usage storage or finish registry updates. Restore a known-good backup and retry. Do not delete usage history."
     }
   }
 }

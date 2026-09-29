@@ -1,20 +1,25 @@
-"""Config flow for Entergy."""
+"""Local credentials and pseudonymous account setup."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
+from uuid import uuid4
 
 from aiohttp import ClientError
 import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import EntergyApiClient, EntergyApiError, EntergyAuthError, EntergyMfaRequired
+from .api import EntergyApiClient, RequestBudget
 from .const import (
     CONF_ACCOUNT_ID,
     CONF_LANGUAGE,
@@ -25,223 +30,191 @@ from .const import (
     MAX_SCAN_INTERVAL_SECONDS,
     MIN_SCAN_INTERVAL_SECONDS,
 )
-
-_LOGGER = logging.getLogger(__name__)
+from .errors import AuthError, ChallengeError, EntergyError
+from .models import Account, Credentials
+from .statistics import statistic_ids
 
 
 def _user_schema(default_language: str = DEFAULT_LANGUAGE) -> vol.Schema:
     return vol.Schema(
         {
             vol.Required(CONF_USERNAME): str,
-            vol.Required(CONF_PASSWORD): str,
+            vol.Required(CONF_PASSWORD): selector.TextSelector(
+                selector.TextSelectorConfig(
+                    type=selector.TextSelectorType.PASSWORD, autocomplete="current-password"
+                )
+            ),
             vol.Optional(CONF_LANGUAGE, default=default_language): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=[
-                        {"value": "en", "label": "English"},
-                        {"value": "es", "label": "Spanish"},
-                    ],
-                    mode=selector.SelectSelectorMode.DROPDOWN,
+                    options=["en", "es"], mode=selector.SelectSelectorMode.DROPDOWN
                 )
             ),
         }
     )
 
 
-def _extract_accounts(raw: Any) -> list[dict[str, Any]]:
-    if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, dict)]
-
-    if isinstance(raw, dict):
-        for key in ("accounts", "data", "items", "results"):
-            value = raw.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-
-        accounts = []
-        for value in raw.values():
-            if isinstance(value, dict):
-                accounts.append(value)
-        if accounts:
-            return accounts
-
-    return []
-
-
-def _account_id(account: dict[str, Any]) -> str | None:
-    for key in (
-        "id",
-        "accountId",
-        "accountID",
-        "account_id",
-        "accountNumber",
-        "account_number",
-        "number",
+def _account_label(account: Account) -> str:
+    label = f"Account ending ••••{account.account_id[-4:]}"
+    nickname = (account.nickname or "").strip()
+    if 1 <= len(nickname) <= 40 and not any(
+        char.isdigit() or char in "\r\n\v\f\x85\u2028\u2029,@" for char in nickname
     ):
-        value = account.get(key)
-        if value:
-            return str(value)
-    return None
-
-
-def _account_label(account: dict[str, Any]) -> str:
-    account_id = _account_id(account) or "Unknown"
-    for key in ("nickname", "name", "serviceAddress", "address", "premiseAddress"):
-        value = account.get(key)
-        if value:
-            return f"{account_id} - {value}"
-    return account_id
+        label += f" ({nickname})"
+    return label
 
 
 async def _validate_and_fetch_accounts(
-    hass: HomeAssistant,
-    username: str,
-    password: str,
-    language: str,
-) -> list[dict[str, Any]]:
-    session = async_get_clientsession(hass)
+    hass: HomeAssistant, data: dict[str, Any]
+) -> tuple[Account, ...]:
     client = EntergyApiClient(
-        session=session,
-        username=username,
-        password=password,
-        language=language,
+        async_get_clientsession(hass),
+        Credentials(data[CONF_USERNAME], data[CONF_PASSWORD]),
+        language=data.get(CONF_LANGUAGE, DEFAULT_LANGUAGE),
     )
-    await client.async_initialize()
-    await client.async_login()
-    raw = await client.async_get_accounts()
-    return _extract_accounts(raw)
+    budget = RequestBudget()
+    try:
+        await client.async_initialize(budget)
+        await client.async_login(budget)
+        accounts = await client.async_get_accounts(budget)
+        return tuple(accounts)
+    finally:
+        await client.async_logout(budget)
 
 
-class EntergyMobileConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle an Entergy config flow."""
+class EntergyMobileConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Configure only after verifying an account with local credentials."""
 
-    VERSION = 1
+    VERSION = 2
+    MINOR_VERSION = 1
 
     def __init__(self) -> None:
-        self._flow_data: dict[str, Any] = {}
+        self._credentials: dict[str, Any] = {}
+        self._accounts: tuple[Account, ...] = ()
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None):
-        """Handle username/password step."""
-        errors: dict[str, str] = {}
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        return await self._credentials_step("user", user_input)
 
-        if user_input is None:
-            return self.async_show_form(step_id="user", data_schema=_user_schema(), errors=errors)
+    async def _credentials_step(
+        self, step: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
+        errors = {}
+        language = DEFAULT_LANGUAGE
+        if user_input is not None:
+            language = user_input.get(CONF_LANGUAGE, DEFAULT_LANGUAGE)
+            try:
+                accounts = await _validate_and_fetch_accounts(self.hass, user_input)
+            except ChallengeError:
+                errors["base"] = "unsupported_challenge"
+            except AuthError:
+                errors["base"] = "invalid_auth"
+            except EntergyError, ClientError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                # Never log exception strings or untrusted payload details.
+                errors["base"] = "unknown"
+            else:
+                credentials = {key: user_input[key] for key in (CONF_USERNAME, CONF_PASSWORD)}
+                credentials[CONF_LANGUAGE] = language
+                if step == "reauth_confirm":
+                    entry = self._get_reauth_entry()
+                    if not any(
+                        account.account_id == entry.data[CONF_ACCOUNT_ID] for account in accounts
+                    ):
+                        return self.async_abort(reason="unique_id_mismatch")
+                    await self.async_set_unique_id(entry.data["public_id"])
+                    self._abort_if_unique_id_mismatch()
+                    return self.async_update_reload_and_abort(entry, data_updates=credentials)
+                if accounts:
+                    self._credentials, self._accounts = credentials, accounts
+                    return await self.async_step_account()
+                errors["base"] = "no_accounts"
+        return self.async_show_form(step_id=step, data_schema=_user_schema(language), errors=errors)
 
-        username = user_input[CONF_USERNAME]
-        password = user_input[CONF_PASSWORD]
-        language = user_input.get(CONF_LANGUAGE, DEFAULT_LANGUAGE)
-
-        try:
-            accounts = await _validate_and_fetch_accounts(self.hass, username, password, language)
-        except EntergyMfaRequired as err:
-            _LOGGER.debug("Entergy setup requires unsupported MFA step: %s", err)
-            errors["base"] = "mfa_required"
-            return self.async_show_form(step_id="user", data_schema=_user_schema(language), errors=errors)
-        except EntergyAuthError as err:
-            _LOGGER.debug("Entergy setup authentication failed: %s", err)
-            errors["base"] = "invalid_auth"
-            return self.async_show_form(step_id="user", data_schema=_user_schema(language), errors=errors)
-        except (EntergyApiError, ClientError) as err:
-            _LOGGER.debug("Entergy setup connection/API failed: %s", err)
-            errors["base"] = "cannot_connect"
-            return self.async_show_form(step_id="user", data_schema=_user_schema(language), errors=errors)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.exception("Unexpected Entergy setup error: %s", err)
-            errors["base"] = "unknown"
-            return self.async_show_form(step_id="user", data_schema=_user_schema(language), errors=errors)
-
-        account_options = []
-        for account in accounts:
-            account_identifier = _account_id(account)
-            if account_identifier:
-                account_options.append({"value": account_identifier, "label": _account_label(account)})
-
-        if not account_options:
-            errors["base"] = "no_accounts"
-            return self.async_show_form(step_id="user", data_schema=_user_schema(language), errors=errors)
-
-        self._flow_data = {
-            CONF_USERNAME: username,
-            CONF_PASSWORD: password,
-            CONF_LANGUAGE: language,
-            "account_options": account_options,
-        }
-        return await self.async_step_account()
-
-    async def async_step_account(self, user_input: dict[str, Any] | None = None):
-        """Handle account selection."""
-        if not self._flow_data:
+    async def async_step_account(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if not self._accounts:
             return await self.async_step_user()
-
-        errors: dict[str, str] = {}
-
-        if user_input is None:
-            return self.async_show_form(
-                step_id="account",
-                data_schema=vol.Schema(
-                    {
-                        vol.Required(CONF_ACCOUNT_ID): selector.SelectSelector(
-                            selector.SelectSelectorConfig(
-                                options=self._flow_data["account_options"],
-                                mode=selector.SelectSelectorMode.DROPDOWN,
-                            )
-                        )
-                    }
-                ),
-                errors=errors,
+        choices = [
+            {"value": str(index), "label": _account_label(account)}
+            for index, account in enumerate(self._accounts)
+        ]
+        if user_input is not None:
+            selection = user_input.get(CONF_ACCOUNT_ID)
+            if selection not in {choice["value"] for choice in choices}:
+                return self.async_abort(reason="invalid_account")
+            account = self._accounts[int(selection)]
+            if any(
+                entry.data.get(CONF_ACCOUNT_ID) == account.account_id
+                for entry in self._async_current_entries()
+            ):
+                return self.async_abort(reason="already_configured")
+            public_id = uuid4().hex
+            statistic_ids(public_id)
+            await self.async_set_unique_id(public_id)
+            return self.async_create_entry(
+                title="Entergy",
+                data={
+                    **self._credentials,
+                    CONF_ACCOUNT_ID: account.account_id,
+                    "public_id": public_id,
+                    "time_zone": account.time_zone or self.hass.config.time_zone,
+                    "ledger_initialized": False,
+                },
+                options={CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS},
             )
-
-        account_id = user_input[CONF_ACCOUNT_ID]
-        username = self._flow_data[CONF_USERNAME]
-
-        await self.async_set_unique_id(f"{username}_{account_id}")
-        self._abort_if_unique_id_configured()
-
-        data = {
-            CONF_USERNAME: username,
-            CONF_PASSWORD: self._flow_data[CONF_PASSWORD],
-            CONF_LANGUAGE: self._flow_data[CONF_LANGUAGE],
-            CONF_ACCOUNT_ID: account_id,
-        }
-
-        return self.async_create_entry(
-            title=f"Entergy {account_id}",
-            data=data,
-            options={CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS},
+        return self.async_show_form(
+            step_id="account",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ACCOUNT_ID): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=choices, mode=selector.SelectSelectorMode.DROPDOWN
+                        )
+                    ),
+                }
+            ),
         )
 
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
+        self._get_reauth_entry()
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        return await self._credentials_step("reauth_confirm", user_input)
+
     @staticmethod
-    def async_get_options_flow(config_entry: config_entries.ConfigEntry):
-        """Return options flow."""
-        return EntergyMobileOptionsFlow(config_entry)
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> EntergyOptionsFlow:
+        return EntergyOptionsFlow()
 
 
-class EntergyMobileOptionsFlow(config_entries.OptionsFlow):
-    """Options flow for Entergy."""
+class EntergyOptionsFlow(OptionsFlowWithReload):
+    """Let HA perform exactly one reload when options change."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self._config_entry = config_entry
-
-    async def async_step_init(self, user_input: dict[str, Any] | None = None):
-        """Manage options."""
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
-
+        interval = max(
+            MIN_SCAN_INTERVAL_SECONDS,
+            min(
+                MAX_SCAN_INTERVAL_SECONDS,
+                int(
+                    self.config_entry.options.get(
+                        CONF_SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_SECONDS
+                    )
+                ),
+            ),
+        )
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Optional(
-                        CONF_SCAN_INTERVAL_SECONDS,
-                        default=self._config_entry.options.get(
-                            CONF_SCAN_INTERVAL_SECONDS,
-                            DEFAULT_SCAN_INTERVAL_SECONDS,
-                        ),
-                    ): vol.All(
+                    vol.Optional(CONF_SCAN_INTERVAL_SECONDS, default=interval): vol.All(
                         vol.Coerce(int),
-                        vol.Range(
-                            min=MIN_SCAN_INTERVAL_SECONDS,
-                            max=MAX_SCAN_INTERVAL_SECONDS,
-                        ),
+                        vol.Range(min=MIN_SCAN_INTERVAL_SECONDS, max=MAX_SCAN_INTERVAL_SECONDS),
                     ),
                 }
             ),
