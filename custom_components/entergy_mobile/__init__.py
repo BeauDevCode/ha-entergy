@@ -128,6 +128,16 @@ def _migrate_registries(
         for entity in entities.entities.values()
         if entity.device_id in device_ids or entity.config_entry_id == entry.entry_id
     ]
+    owned_deleted = [
+        item
+        for item in entities.deleted_entities.values()
+        if item.config_entry_id == entry.entry_id
+    ]
+    # Public alias updates only change aliases_v2. HA retains compat_aliases in
+    # serialized live/deleted history and exposes no supported scrub operation.
+    # Block before any registry mutation rather than finalize with retained PII.
+    if any(unsafe(alias) for item in (*attached, *owned_deleted) for alias in item.compat_aliases):
+        raise LedgerRepairError
     # Persist the decision before the first rename; subsequent retries must still
     # rename safe-looking peers after the original offending ID has disappeared.
     rename_all = entry.data.get(

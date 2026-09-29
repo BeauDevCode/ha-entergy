@@ -601,3 +601,182 @@ async def test_restart_after_store_rename_blocks_without_saved_entry_or_issue(
     assert not any(name.startswith(f"{DOMAIN}.ledger_") for name in hass_storage)
     issue = ir.async_get(hass).async_get_issue(DOMAIN, f"ledger_repair_{entry.entry_id}")
     assert issue is not None and issue.is_persistent
+
+
+async def _load_compat_alias_fixture(
+    hass: HomeAssistant, entry: Any, alias: str, *, attached: bool = False
+) -> tuple[er.EntityRegistry, er.RegistryEntry]:
+    """Load a synthetic legacy snapshot through HA's supported registry loader."""
+    import json
+
+    from homeassistant.helpers.json import json_bytes
+    from homeassistant.helpers.storage import Store
+
+    entities = er.async_get(hass)
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, "12-34")}
+    )
+    owner = entry
+    if attached:
+        owner = common.MockConfigEntry(domain="synthetic_peer", data={})
+        owner.add_to_hass(hass)
+    entity = entities.async_get_or_create(
+        "sensor",
+        owner.domain,
+        f"{DOMAIN}_{entry.entry_id}_12-34_total_import_kwh",
+        config_entry=owner,
+        device_id=device.id,
+        suggested_object_id="safe_total",
+    )
+    serialized = json.loads(json_bytes(entity.as_storage_fragment))
+    serialized["aliases"] = [alias]
+    serialized["aliases_v2"] = []
+    snapshot = {
+        "entities": [serialized],
+        "deleted_entities": [],
+        "settings": {"entity_id_parts": None},
+    }
+    # Only mock the storage read boundary; do not mutate registry internals/files.
+    with patch.object(Store, "async_load", return_value=snapshot):
+        await entities.async_load()
+    loaded = entities.async_get(entity.id)
+    assert loaded is not None and loaded.compat_aliases == [alias]
+    return entities, loaded
+
+
+@pytest.mark.parametrize(
+    "alias", ["Account 12-34", "Account 12_34", "private-user", "PRIVATE_USER"]
+)
+@pytest.mark.parametrize("attached", [False, True])
+async def test_private_compat_alias_blocks_migration_without_accepting_serialized_pii(
+    hass: HomeAssistant, alias: str, attached: bool
+) -> None:
+    import json
+
+    from homeassistant.helpers.json import json_bytes
+
+    entry = common.MockConfigEntry(
+        domain=DOMAIN, version=1, data={"username": "private-user", "account_id": "12-34"}
+    )
+    entry.add_to_hass(hass)
+    entities, entity = await _load_compat_alias_fixture(hass, entry, alias, attached=attached)
+    before = json.loads(json_bytes(entity.as_storage_fragment))
+    assert before["aliases"] == [alias]
+    assert not await integration.async_migrate_entry(hass, entry)
+    assert entry.version == 1
+    after = entities.async_get(entity.id)
+    assert after is not None
+    assert json.loads(json_bytes(after.as_storage_fragment)) == before
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"ledger_repair_{entry.data['public_id']}")
+    assert issue is not None and issue.active and issue.is_persistent
+    assert issue.translation_placeholders is None
+    assert alias not in str(issue)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+async def test_private_compat_alias_blocks_startup_before_client_creation(
+    hass: HomeAssistant, deleted: bool
+) -> None:
+    import json
+    from unittest.mock import AsyncMock
+
+    from custom_components.entergy_mobile.errors import AuthError
+    from homeassistant.exceptions import ConfigEntryNotReady
+    from homeassistant.helpers.json import json_bytes
+
+    public = "a" * 32
+    entry = common.MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        minor_version=1,
+        unique_id=public,
+        data={
+            "username": "private-user",
+            "password": "synthetic",
+            "account_id": "12-34",
+            "public_id": public,
+            "migration_rename_all": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    entities, entity = await _load_compat_alias_fixture(hass, entry, "Account 12-34")
+    if deleted:
+        entities.async_remove(entity.entity_id)
+    client = AsyncMock()
+    client.async_initialize.side_effect = AuthError()
+    with (
+        patch(
+            "custom_components.entergy_mobile.EntergyApiClient", return_value=client
+        ) as constructor,
+        pytest.raises(ConfigEntryNotReady, match="ledger_repair"),
+    ):
+        await integration.async_setup_entry(hass, entry)
+    assert not constructor.called
+    retained = (
+        next(item for item in entities.deleted_entities.values() if item.id == entity.id)
+        if deleted
+        else entities.async_get(entity.id)
+    )
+    assert retained is not None
+    assert json.loads(json_bytes(retained.as_storage_fragment))["aliases"] == ["Account 12-34"]
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"ledger_repair_{public}")
+    assert issue is not None and issue.is_persistent and issue.translation_placeholders is None
+
+
+async def test_safe_compat_alias_does_not_block_migration_or_recovery(hass: HomeAssistant) -> None:
+    import json
+
+    from homeassistant.helpers.json import json_bytes
+
+    entry = common.MockConfigEntry(
+        domain=DOMAIN, version=1, data={"username": "private-user", "account_id": "12-34"}
+    )
+    entry.add_to_hass(hass)
+    entities, entity = await _load_compat_alias_fixture(hass, entry, "Utility usage")
+    assert await integration.async_migrate_entry(hass, entry)
+    assert entry.version == 2 and entry.minor_version == 1
+    assert await integration.async_recover_migration(hass, entry)
+    after = entities.async_get(entity.id)
+    assert after is not None
+    serialized = json.loads(json_bytes(after.as_storage_fragment))
+    assert serialized["aliases"] == ["Utility usage"]
+    assert "12-34" not in json.dumps(serialized) and "private-user" not in json.dumps(serialized)
+
+
+@pytest.mark.parametrize("alias", ["Account 12-34", "Account 12_34"])
+async def test_deleted_compat_alias_blocks_before_any_live_registry_mutation(
+    hass: HomeAssistant, alias: str
+) -> None:
+    import json
+
+    from homeassistant.helpers.json import json_bytes
+
+    entry = common.MockConfigEntry(
+        domain=DOMAIN, version=1, data={"username": "private-user", "account_id": "12-34"}
+    )
+    entry.add_to_hass(hass)
+    entities, entity = await _load_compat_alias_fixture(hass, entry, alias)
+    # Model a user deletion through HA's supported API, without editing history.
+    entities.async_remove(entity.entity_id)
+    deleted = next(
+        item
+        for item in entities.deleted_entities.values()
+        if item.config_entry_id == entry.entry_id
+    )
+    before_deleted = json.loads(json_bytes(deleted.as_storage_fragment))
+    live = entities.async_get_or_create(
+        "sensor",
+        DOMAIN,
+        f"{DOMAIN}_{entry.entry_id}_12-34_latest_hour_net_kwh",
+        config_entry=entry,
+        suggested_object_id="safe_live",
+    )
+    before_live = json.loads(json_bytes(live.as_storage_fragment))
+    assert not await integration.async_migrate_entry(hass, entry)
+    assert entry.version == 1
+    unchanged = entities.async_get(live.id)
+    assert unchanged is not None
+    assert json.loads(json_bytes(unchanged.as_storage_fragment)) == before_live
+    assert json.loads(json_bytes(deleted.as_storage_fragment)) == before_deleted
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"ledger_repair_{entry.data['public_id']}")
+    assert issue is not None and issue.is_persistent and issue.translation_placeholders is None
