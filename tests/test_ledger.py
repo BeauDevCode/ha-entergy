@@ -2,18 +2,25 @@
 
 from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal, Inexact, localcontext
+from itertools import permutations
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from custom_components.entergy_mobile import ledger as api
 from custom_components.entergy_mobile.ledger import (
     EntergyLedger,
     LedgerRepairError,
     async_import_legacy_v1_store,
 )
-from custom_components.entergy_mobile.models import EnergyInterval, LedgerMutation, LedgerTotals
+from custom_components.entergy_mobile.models import (
+    EnergyInterval,
+    LedgerMutation,
+    LedgerState,
+    LedgerTotals,
+)
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util.file import WriteError
@@ -548,3 +555,289 @@ async def test_legacy_rejects_cached_maximum_below_current_signed_usage(
     with pytest.raises(LedgerRepairError, match="ledger_repair"):
         await async_import_legacy_v1_store(hass, entry_id="test-entry", public_id=PUBLIC_ID)
     assert hass_storage == before
+
+
+def hour_record(index: int, value: str = "1") -> EnergyInterval:
+    start = HOUR + timedelta(hours=index)
+    return replace(
+        interval(),
+        start=start,
+        end=start + timedelta(hours=1),
+        import_kwh=Decimal(value),
+        amount=None,
+        is_estimated=False,
+    )
+
+
+def test_reconcile_first_insert_duplicates_and_order_independence() -> None:
+    state = LedgerState(schema_version=2)
+    records = (hour_record(0), hour_record(2), hour_record(1))
+    before = api._encode(state)
+    candidates = []
+    for order in permutations(records):
+        result = api.reconcile(state, (*order, order[0]), received_at=HOUR)
+        assert (result.inserted, result.corrected, result.estimated) == (3, 0, 0)
+        assert result.earliest_statistics_hour == HOUR
+        assert result.state.revision == 1
+        candidates.append(result.state)
+        repeat = api.reconcile(result.state, reversed(records), received_at=HOUR)
+        assert repeat.state is result.state
+        assert repeat.earliest_statistics_hour is None
+        assert repeat.inserted == repeat.corrected == 0
+    assert all(candidate == candidates[0] for candidate in candidates)
+    assert api._encode(state) == before
+
+
+@pytest.mark.parametrize("value", ["0.5", "4"])
+def test_correction_rebuilds_every_later_cumulative_sum(value: str) -> None:
+    records = tuple(hour_record(index) for index in range(4))
+    state = LedgerState(
+        schema_version=2, revision=7, intervals=records, baseline=LedgerTotals(Decimal("10"))
+    )
+    result = api.reconcile(state, [hour_record(1, value)], received_at=HOUR)
+    assert result.state.revision == 8
+    assert result.corrected == 1 and result.inserted == 0
+    assert result.earliest_statistics_hour == HOUR + timedelta(hours=1)
+    assert state.intervals == records
+    expected = ["11", "11.5", "12.5", "13.5"] if value == "0.5" else ["11", "15", "16", "17"]
+    assert [total.import_kwh for _, total in api.cumulative_totals(result.state)] == list(
+        map(Decimal, expected)
+    )
+
+
+def test_reconcile_estimated_to_actual_and_receipt_only_noop() -> None:
+    estimated = replace(hour_record(0), is_estimated=True)
+    result = api.reconcile(LedgerState(schema_version=2), [estimated], received_at=HOUR)
+    assert result.estimated == 1
+    actual = replace(estimated, is_estimated=False)
+    correction = api.reconcile(result.state, [actual], received_at=HOUR)
+    assert correction.corrected == 1 and correction.estimated == 0
+    newer = replace(actual, received_at=HOUR + timedelta(days=1))
+    assert api.reconcile(correction.state, [newer], received_at=HOUR).state is correction.state
+
+
+def test_reconcile_missing_intervals_and_marker_only_revision() -> None:
+    state = LedgerState(schema_version=2, intervals=(hour_record(0), hour_record(1)))
+    assert api.reconcile(state, [hour_record(1)], received_at=HOUR).state is state
+    result = api.reconcile(
+        state, [], received_at=HOUR, backfill_cursor=HOUR, backfill_complete=True
+    )
+    assert result.state.intervals == state.intervals
+    assert result.state.revision == 1 and result.state.backfill_complete
+    assert result.state.backfill_cursor == HOUR and result.earliest_statistics_hour is None
+    assert (
+        api.reconcile(
+            result.state, [], received_at=HOUR, backfill_cursor=HOUR, backfill_complete=True
+        ).state
+        is result.state
+    )
+    cleared = api.reconcile(
+        result.state, [], received_at=HOUR, backfill_cursor=None, backfill_complete=False
+    )
+    assert cleared.state.revision == 2 and cleared.state.backfill_cursor is None
+    assert not cleared.state.backfill_complete
+
+
+@pytest.mark.parametrize(
+    ("overlaps", "changed", "value", "quarantined"),
+    [
+        (24, 19, "2", True),
+        (23, 23, "2", False),
+        (24, 18, "2", False),
+        (24, 24, "1.25", False),
+        (24, 24, "1.2500000000000000000000000001", True),
+        (24, 24, "0.75", False),
+        (24, 24, "0.7499999999999999999999999999", True),
+    ],
+)
+def test_quarantine_requires_all_three_strict_thresholds(
+    overlaps: int, changed: int, value: str, quarantined: bool
+) -> None:
+    state = LedgerState(
+        schema_version=2, revision=8, intervals=tuple(hour_record(i) for i in range(overlaps))
+    )
+    before = api._encode(state)
+    incoming = [hour_record(i, value if i < changed else "1") for i in range(overlaps)] + [
+        hour_record(30)
+    ]
+    with localcontext() as ctx:
+        ctx.prec = 2
+        result = api.reconcile(state, incoming, received_at=HOUR, backfill_complete=True)
+    assert api._encode(state) == before
+    if quarantined:
+        assert result.state is state and result.deferred and result.repair
+        assert result.earliest_statistics_hour is None
+        assert result.inserted == result.corrected == result.estimated == 0
+        assert api._encode(result.state) == before
+    else:
+        assert not result.deferred and result.repair is None
+        assert result.state.revision == 9 and result.state.backfill_complete
+
+
+def test_quarantine_uses_aggregate_import_plus_return_and_accepts_estimate_updates() -> None:
+    records = tuple(
+        replace(hour_record(i, "0"), return_kwh=Decimal("2"), is_estimated=True) for i in range(24)
+    )
+    state = LedgerState(schema_version=2, intervals=records)
+    actual = [replace(item, is_estimated=False) for item in records]
+    assert api.reconcile(state, actual, received_at=HOUR).corrected == 24
+    # Direction changes without aggregate energy change are not mass changes.
+    switched = [replace(item, import_kwh=Decimal("2"), return_kwh=Decimal(0)) for item in records]
+    assert not api.reconcile(state, switched, received_at=HOUR).deferred
+    reduced = [replace(item, return_kwh=Decimal("1")) for item in records]
+    assert api.reconcile(state, reduced, received_at=HOUR).state is state
+
+
+def test_quarantine_conflicting_same_hour_is_atomic() -> None:
+    state = LedgerState(schema_version=2)
+    result = api.reconcile(
+        state, [hour_record(0), hour_record(1), hour_record(0, "2")], received_at=HOUR
+    )
+    assert result.state is state and result.deferred and result.repair
+
+
+def test_retention_moves_exact_four_channel_totals_and_keeps_boundary_hour() -> None:
+    records = (
+        replace(
+            hour_record(-2, "1.12345678901234567890123456789"),
+            amount=Decimal("0.12345678901234567890123456789"),
+        ),
+        replace(
+            hour_record(-1, "0"),
+            return_kwh=Decimal("2.12345678901234567890123456789"),
+            amount=Decimal("-0.22345678901234567890123456789"),
+        ),
+        hour_record(0, "3"),
+        hour_record(1, "4"),
+    )
+    state = LedgerState(
+        schema_version=2,
+        intervals=records,
+        baseline=LedgerTotals(Decimal("10"), Decimal("20"), Decimal("30"), Decimal("40")),
+    )
+    receipt = HOUR + timedelta(days=400, minutes=30)
+    with localcontext() as ctx:
+        ctx.prec = 2
+        ctx.traps[Inexact] = True
+        result = api.reconcile(state, [], received_at=receipt)
+        totals = api.cumulative_totals(result.state)
+        assert totals == api.cumulative_totals(state)[2:]
+    assert result.state.intervals == records[2:]
+    assert result.state.baseline == LedgerTotals(
+        Decimal("11.12345678901234567890123456789"),
+        Decimal("22.12345678901234567890123456789"),
+        Decimal("30.12345678901234567890123456789"),
+        Decimal("40.22345678901234567890123456789"),
+    )
+    assert totals[-1][1].import_kwh == Decimal("18.12345678901234567890123456789")
+    assert result.earliest_statistics_hour == records[0].start
+    assert result.state.revision == 1
+    # Compacted hours cannot be added to the baseline for a second time.
+    assert api.reconcile(result.state, records, received_at=receipt).state is result.state
+    assert state.intervals == records and state.baseline.import_kwh == 10
+
+
+def test_retention_applies_correction_before_compacting_known_hour() -> None:
+    state = LedgerState(schema_version=2, intervals=(hour_record(-1, "5"), hour_record(0)))
+    result = api.reconcile(state, [hour_record(-1, "2")], received_at=HOUR + timedelta(days=400))
+    assert result.corrected == 1 and result.state.baseline.import_kwh == 2
+    assert result.state.intervals == (hour_record(0),)
+    assert result.state.revision == 1
+
+
+@pytest.mark.parametrize(
+    "receipt", [HOUR.replace(tzinfo=None), HOUR.astimezone(timezone(timedelta(hours=1)))]
+)
+def test_reconcile_rejects_non_utc_receipt(receipt: datetime) -> None:
+    with pytest.raises(ValueError, match="invalid ledger timestamp"):
+        api.reconcile(LedgerState(schema_version=2), [], received_at=receipt)
+
+
+def test_correction_rebuilds_return_cost_and_compensation_in_both_directions() -> None:
+    records = tuple(
+        replace(hour_record(i), return_kwh=Decimal("3"), amount=Decimal("0.5")) for i in range(3)
+    )
+    state = LedgerState(schema_version=2, intervals=records)
+    correction = replace(records[0], return_kwh=Decimal("1"), amount=Decimal("-0.2"))
+    result = api.reconcile(state, [correction], received_at=HOUR)
+    assert [total for _, total in api.cumulative_totals(result.state)] == [
+        LedgerTotals(Decimal("1"), Decimal("1"), Decimal("0"), Decimal("0.2")),
+        LedgerTotals(Decimal("2"), Decimal("4"), Decimal("0.5"), Decimal("0.2")),
+        LedgerTotals(Decimal("3"), Decimal("7"), Decimal("1"), Decimal("0.2")),
+    ]
+    restored = api.reconcile(result.state, [records[0]], received_at=HOUR)
+    assert api.cumulative_totals(restored.state) == api.cumulative_totals(state)
+
+
+def test_quarantine_preserves_pending_markers_baselines_and_prunable_hours() -> None:
+    records = tuple(hour_record(i) for i in range(24))
+    state = LedgerState(
+        schema_version=2,
+        revision=5,
+        intervals=records,
+        baseline=LedgerTotals(Decimal("10")),
+        statistics_pending_from=HOUR,
+        statistics_pending_fingerprint=FINGERPRINT,
+    )
+    before = api._encode(state)
+    totals = api.cumulative_totals(state)
+    result = api.reconcile(
+        state,
+        [hour_record(i, "2") for i in range(24)],
+        received_at=HOUR + timedelta(days=402),
+        backfill_complete=True,
+    )
+    assert result.state is state and result.deferred
+    assert api._encode(result.state) == before
+    assert api.cumulative_totals(result.state) == totals
+
+
+async def test_quarantine_explicit_retraction_preserves_verified_store(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    from custom_components.entergy_mobile.errors import PayloadError
+    from custom_components.entergy_mobile.parser import parse_usage
+
+    ledger = await loaded(hass)
+    await ledger.async_ingest(mutation(ledger))
+    before = deepcopy(hass_storage[KEY])
+    state = ledger.state
+    totals = api.cumulative_totals(state)
+    payload = {
+        "data": {
+            "daily": {
+                "electric": [
+                    {
+                        "hourly": [
+                            {
+                                "date": HOUR.isoformat(),
+                                "usage": "0",
+                                "isEstimated": False,
+                                "retracted": True,
+                            },
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+    with pytest.raises(PayloadError):
+        incoming = parse_usage(payload, source_time_zone="America/Chicago", received_at=HOUR)
+        await ledger.async_ingest(api.reconcile(state, incoming, received_at=HOUR))
+    assert ledger.state is state and hass_storage[KEY] == before
+    assert api.cumulative_totals(ledger.state) == totals
+
+
+def test_reconcile_exact_totals_ignore_active_exponent_limits() -> None:
+    state = LedgerState(
+        schema_version=2,
+        intervals=(hour_record(0, "12345.00000000012345"),),
+        baseline=LedgerTotals(Decimal("0.00000000000001")),
+    )
+    with localcontext() as ctx:
+        ctx.prec = 2
+        ctx.Emax = 2
+        ctx.Emin = -2
+        ctx.traps[Inexact] = True
+        totals = api.cumulative_totals(state)
+    assert totals[0][1].import_kwh == Decimal("12345.00000000012346")

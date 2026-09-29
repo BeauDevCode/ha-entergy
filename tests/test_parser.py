@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from custom_components.entergy_mobile.errors import ChallengeError, PayloadError
-from custom_components.entergy_mobile.models import Freshness, LedgerState
+from custom_components.entergy_mobile.models import EnergyInterval, Freshness, LedgerState
 from custom_components.entergy_mobile.parser import (
     parse_account,
     parse_accounts,
@@ -34,7 +34,7 @@ def record(date: str, value: object = 1, **extra: object) -> dict[str, object]:
     return {"date": date, "usage": value, "isEstimated": False, **extra}
 
 
-def parse(payload: object) -> tuple:
+def parse(payload: object) -> tuple[EnergyInterval, ...]:
     return parse_usage(payload, source_time_zone="America/Chicago", received_at=RECEIVED)
 
 
@@ -240,3 +240,16 @@ def test_login_inspects_all_challenges_before_accepting_token(payload: object) -
 def test_login_requires_nonempty_string_token(payload: object) -> None:
     with pytest.raises(PayloadError):
         parse_login(payload)
+
+
+@pytest.mark.parametrize(
+    "key", ["deleted", "isDeleted", "retracted", "retraction", "status", "unknown"]
+)
+def test_usage_quarantine_rejects_unreviewed_hourly_fields(key: str) -> None:
+    payload = usage(
+        record("2026-09-27T10:00:00Z"), record("2026-09-27T11:00:00Z", **{key: "private-canary"})
+    )
+    with pytest.raises(PayloadError) as error:
+        parse(payload)
+    assert "private-canary" not in str(error.value)
+    assert key not in str(error.value)

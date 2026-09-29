@@ -336,6 +336,8 @@ def parse_usage(
             if seen > _MAX_RECORDS:
                 raise PayloadError
             hour = _object(raw)
+            if hour.keys() - {"date", "usage", "cost", "isEstimated", "currency", "sourceRevision"}:
+                raise PayloadError
             start = _timestamp(hour.get("date"))
             signed_usage = _decimal(hour.get("usage"))
             if signed_usage.copy_abs() > _MAX_KWH:

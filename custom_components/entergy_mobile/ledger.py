@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, localcontext
+from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
+from enum import Enum
 from hashlib import sha256
 from typing import Any
 
@@ -18,6 +20,143 @@ from .models import EnergyInterval, LedgerMutation, LedgerState, LedgerTotals
 
 _SCHEMA_VERSION = 2
 _REPAIR = "ledger_repair"
+
+
+class _Unchanged(Enum):
+    VALUE = "unchanged"
+
+
+UNCHANGED = _Unchanged.VALUE
+
+
+def _exact_sum(values: Iterable[Decimal]) -> Decimal:
+    """Sum finite values exactly, independently of the caller's Decimal context."""
+    items = tuple(values)
+    if not items:
+        return Decimal(0)
+    precision = max(
+        1,
+        max(item.adjusted() for item in items)
+        - min(int(item.as_tuple().exponent) for item in items)
+        + len(str(len(items)))
+        + 2,
+    )
+    with localcontext(Context(prec=precision, Emax=MAX_EMAX, Emin=MIN_EMIN)):
+        return sum(items, Decimal(0))
+
+
+def _add_interval(totals: LedgerTotals, item: EnergyInterval) -> LedgerTotals:
+    amount = item.amount if item.amount is not None else Decimal(0)
+    return LedgerTotals(
+        _exact_sum((totals.import_kwh, item.import_kwh)),
+        _exact_sum((totals.return_kwh, item.return_kwh)),
+        _exact_sum((totals.cost, max(amount, Decimal(0)))),
+        _exact_sum((totals.compensation, max(amount.copy_negate(), Decimal(0)))),
+    )
+
+
+def cumulative_totals(state: LedgerState) -> tuple[tuple[datetime, LedgerTotals], ...]:
+    """Rebuild exact cumulative values from the baseline and canonical hours.
+
+    Consumers may select the suffix starting at earliest_statistics_hour. A
+    corrected hour contributes its current value, including downward revisions.
+    """
+    totals = state.baseline
+    rows = []
+    for item in state.intervals:
+        totals = _add_interval(totals, item)
+        rows.append((item.start, totals))
+    return tuple(rows)
+
+
+def reconcile(
+    state: LedgerState,
+    incoming: Iterable[EnergyInterval],
+    *,
+    received_at: datetime,
+    backfill_cursor: datetime | None | _Unchanged = UNCHANGED,
+    backfill_complete: bool | _Unchanged = UNCHANGED,
+) -> LedgerMutation:
+    """Prepare one immutable revision without Store or Recorder operations.
+
+    Missing records never delete known hours. Conflicting duplicates and mass
+    revisions reject the entire response, including pruning and marker changes.
+    Hours already outside retention and absent from the ledger are ignored:
+    their contributions may already be compacted into the opaque baseline.
+    """
+    _iso(received_at)
+    cursor = state.backfill_cursor if backfill_cursor is UNCHANGED else backfill_cursor
+    complete = state.backfill_complete if backfill_complete is UNCHANGED else backfill_complete
+    assert not isinstance(cursor, _Unchanged) and not isinstance(complete, _Unchanged)
+    _iso(cursor)
+    _boolean(complete)
+    known = {item.start: item for item in state.intervals}
+    candidate: dict[datetime, EnergyInterval] = {}
+    for item in incoming:
+        prior = candidate.get(item.start)
+        if prior is not None and prior.fingerprint != item.fingerprint:
+            return LedgerMutation(state, deferred=True, repair="usage_quarantine")
+        candidate[item.start] = item
+
+    overlap = [item for start, item in candidate.items() if start in known]
+    changed = [item for item in overlap if item.fingerprint != known[item.start].fingerprint]
+    if len(overlap) >= 24 and len(changed) * 4 > len(overlap) * 3:
+        prior_energy = _exact_sum(
+            value
+            for item in overlap
+            for value in (known[item.start].import_kwh, known[item.start].return_kwh)
+        )
+        new_energy = _exact_sum(
+            value for item in overlap for value in (item.import_kwh, item.return_kwh)
+        )
+        delta = _exact_sum((new_energy, prior_energy.copy_negate())).copy_abs()
+        if _exact_sum((delta,) * 4) > prior_energy:
+            return LedgerMutation(state, deferred=True, repair="usage_quarantine")
+
+    cutoff = received_at - timedelta(days=400)
+    inserted = corrected = estimated = 0
+    changed_hours = []
+    for start, item in candidate.items():
+        prior = known.get(start)
+        if prior is None and item.end <= cutoff:
+            continue
+        if prior is not None and prior.fingerprint == item.fingerprint:
+            continue
+        known[start] = item
+        inserted += prior is None
+        corrected += prior is not None
+        estimated += item.is_estimated
+        changed_hours.append(start)
+
+    baseline = state.baseline
+    retained = []
+    for item in sorted(known.values(), key=lambda item: item.start):
+        if item.end <= cutoff:
+            baseline = _add_interval(baseline, item)
+            changed_hours.append(item.start)
+        else:
+            retained.append(item)
+    if (
+        not changed_hours
+        and cursor == state.backfill_cursor
+        and complete == state.backfill_complete
+    ):
+        return LedgerMutation(state)
+    next_state = replace(
+        state,
+        revision=state.revision + 1,
+        intervals=tuple(retained),
+        baseline=baseline,
+        backfill_cursor=cursor,
+        backfill_complete=complete,
+    )
+    return LedgerMutation(
+        next_state,
+        inserted=inserted,
+        corrected=corrected,
+        estimated=estimated,
+        earliest_statistics_hour=min(changed_hours) if changed_hours else None,
+    )
 
 
 class LedgerRepairError(Exception):
