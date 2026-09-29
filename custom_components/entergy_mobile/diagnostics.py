@@ -1,39 +1,45 @@
-"""Diagnostics support for Entergy."""
+"""Strictly allowlisted diagnostics for Entergy Usage."""
 
 from __future__ import annotations
 
-from typing import Any
-
-from homeassistant.components.diagnostics import async_redact_data
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import HomeAssistant
+from homeassistant.loader import async_get_integration
 
-from . import get_coordinator
+from . import EntergyConfigEntry
+from .const import DOMAIN
 
-TO_REDACT = {
-    CONF_USERNAME,
-    CONF_PASSWORD,
-    "access_token",
-    "accessToken",
-    "Authorization",
-    "clientId",
-    "raw",
-}
+type _DiagnosticValue = str | int | bool | None
+
+_APPROVED = (
+    "configured_poll_seconds",
+    "next_poll_seconds",
+    "last_successful_fetch",
+    "newest_interval",
+    "error_category",
+    "retained_interval_count",
+    "estimated_interval_count",
+    "last_inserted_count",
+    "last_corrected_count",
+    "freshness",
+    "backfill_pages_completed",
+    "backfill_pages_total",
+    "backfill_complete",
+)
 
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
-    entry: ConfigEntry,
-) -> dict[str, Any]:
-    """Return diagnostics for a config entry."""
-    coordinator = get_coordinator(hass, entry)
-    data = {
-        "entry": {
-            "data": dict(entry.data),
-            "options": dict(entry.options),
-        },
-        "last_update_success": coordinator.last_update_success,
-        "coordinator_data": coordinator.data,
+    entry: EntergyConfigEntry,
+) -> dict[str, _DiagnosticValue]:
+    """Build a new object from the fixed public diagnostics contract."""
+    status = entry.runtime_data.coordinator.diagnostics()
+    integration = await async_get_integration(hass, DOMAIN)
+    result: dict[str, _DiagnosticValue] = {
+        "integration_version": str(integration.version),
+        "home_assistant_version": HA_VERSION,
     }
-    return async_redact_data(data, TO_REDACT)
+    for key in _APPROVED:
+        value = status.get(key)
+        result[key] = value if isinstance(value, (str, int, bool)) or value is None else None
+    return result

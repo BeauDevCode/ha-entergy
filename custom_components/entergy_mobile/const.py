@@ -17,11 +17,3 @@ MIN_SCAN_INTERVAL_SECONDS: Final = 3600
 MAX_SCAN_INTERVAL_SECONDS: Final = 86400
 
 API_ORIGIN: Final = "https://prod.entergy.mindgrb.io"
-
-STORAGE_VERSION: Final = 1
-STORAGE_KEY_PREFIX: Final = "entergy_mobile_usage"
-
-ATTR_ACCOUNT_ID: Final = "account_id"
-ATTR_LAST_UPDATE: Final = "last_update"
-ATTR_LAST_INTERVAL: Final = "last_interval"
-ATTR_IS_ESTIMATED: Final = "is_estimated"

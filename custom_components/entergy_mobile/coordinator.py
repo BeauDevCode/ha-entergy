@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 import logging
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -464,14 +464,11 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
         await self._client.async_get_account(self._account_id, budget)
         pages: list[EnergyInterval] = []
         for start in self._normal_starts(today):
-            page = cast(
-                tuple[EnergyInterval, ...],
-                await self._client.async_get_weekly_usage(
-                    self._account_id,
-                    start,
-                    budget,
-                    fallback_time_zone=self._time_zone,
-                ),
+            page = await self._client.async_get_weekly_usage(
+                self._account_id,
+                start,
+                budget,
+                fallback_time_zone=self._time_zone,
             )
             pages.extend(page)
         self._normal_network_healthy = True
@@ -647,14 +644,11 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
                 start, floor, complete = self._next_backfill_page(now)
                 budget = RequestBudget()
                 await self._client.async_get_account(self._account_id, budget)
-                incoming = cast(
-                    tuple[EnergyInterval, ...],
-                    await self._client.async_get_weekly_usage(
-                        self._account_id,
-                        start,
-                        budget,
-                        fallback_time_zone=self._time_zone,
-                    ),
+                incoming = await self._client.async_get_weekly_usage(
+                    self._account_id,
+                    start,
+                    budget,
+                    fallback_time_zone=self._time_zone,
                 )
                 cursor_before = self._ledger.state.backfill_cursor
                 cursor_date = (

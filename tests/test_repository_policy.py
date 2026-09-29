@@ -111,3 +111,46 @@ def test_no_representative_credentials_or_private_keys_are_tracked() -> None:
         if any(pattern.search(content) for pattern in patterns):
             violations.append(str(path.relative_to(ROOT)))
     assert violations == []
+
+
+def test_temporary_runtime_compatibility_paths_are_absent() -> None:
+    production = "\n".join(
+        path.read_text() for path in (ROOT / "custom_components/entergy_mobile").glob("*.py")
+    )
+    for forbidden in (
+        "EntergyApiError",
+        "EntergyAuthError",
+        "EntergyMfaRequired",
+        "EntergyLoginResult",
+        "_legacy_raw",
+        "async_fetch_current_usage",
+        "def get_coordinator",
+        "hass.data[DOMAIN]",
+        "hass.data.setdefault(DOMAIN",
+    ):
+        assert forbidden not in production
+    api = (ROOT / "custom_components/entergy_mobile/api.py").read_text()
+    assert "username: str | None" not in api
+    assert "password: str | None" not in api
+    assert "RequestBudget | None" not in api
+
+
+def test_diagnostics_uses_allowlist_instead_of_serialization_or_redaction() -> None:
+    diagnostics = (ROOT / "custom_components/entergy_mobile/diagnostics.py").read_text()
+    for forbidden in (
+        "entry.as_dict",
+        "async_redact_data",
+        "coordinator.data",
+        "last_exception",
+    ):
+        assert forbidden not in diagnostics
+
+
+def test_no_temporary_mypy_ignore_errors_and_translations_match() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text()
+    assert "ignore_errors = true" not in pyproject
+    strings = json.loads((ROOT / "custom_components/entergy_mobile/strings.json").read_text())
+    translations = json.loads(
+        (ROOT / "custom_components/entergy_mobile/translations/en.json").read_text()
+    )
+    assert strings == translations

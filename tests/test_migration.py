@@ -289,9 +289,8 @@ async def test_final_version_startup_recovers_registry_snapshot_before_runtime(
     hass: HomeAssistant, hass_storage: dict[str, Any]
 ) -> None:
     """A persisted final config entry must not skip delayed registry cleanup."""
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
-    from custom_components.entergy_mobile.errors import AuthError
     from homeassistant.exceptions import ConfigEntryAuthFailed
 
     entry = common.MockConfigEntry(
@@ -330,9 +329,16 @@ async def test_final_version_startup_recovers_registry_snapshot_before_runtime(
     )
     assert entry.version == 2 and entry.minor_version == 1
     client = AsyncMock()
-    client.async_initialize.side_effect = AuthError()
+    client.authenticated = False
+    client.clear_token = Mock()
+    coordinator = AsyncMock()
+    coordinator.async_initialize.side_effect = ConfigEntryAuthFailed("auth")
     with (
         patch("custom_components.entergy_mobile.EntergyApiClient", return_value=client),
+        patch(
+            "custom_components.entergy_mobile.EntergyDataUpdateCoordinator",
+            return_value=coordinator,
+        ),
         pytest.raises(ConfigEntryAuthFailed),
     ):
         await integration.async_setup_entry(hass, entry)
@@ -680,7 +686,6 @@ async def test_private_compat_alias_blocks_startup_before_client_creation(
     import json
     from unittest.mock import AsyncMock
 
-    from custom_components.entergy_mobile.errors import AuthError
     from homeassistant.exceptions import ConfigEntryNotReady
     from homeassistant.helpers.json import json_bytes
 
@@ -702,11 +707,9 @@ async def test_private_compat_alias_blocks_startup_before_client_creation(
     entities, entity = await _load_compat_alias_fixture(hass, entry, "Account 12-34")
     if deleted:
         entities.async_remove(entity.entity_id)
-    client = AsyncMock()
-    client.async_initialize.side_effect = AuthError()
     with (
         patch(
-            "custom_components.entergy_mobile.EntergyApiClient", return_value=client
+            "custom_components.entergy_mobile.EntergyApiClient", return_value=AsyncMock()
         ) as constructor,
         pytest.raises(ConfigEntryNotReady, match="ledger_repair"),
     ):

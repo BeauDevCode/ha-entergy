@@ -135,7 +135,7 @@ class EntergyMobileConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         if not self._accounts:
             return await self.async_step_user()
-        choices = [
+        choices: list[selector.SelectOptionDict] = [
             {"value": str(index), "label": _account_label(account)}
             for index, account in enumerate(self._accounts)
         ]

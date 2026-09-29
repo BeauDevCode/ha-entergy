@@ -1,17 +1,20 @@
-"""The Entergy integration."""
+"""The Entergy Usage integration lifecycle and migration."""
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import os.path
 import re
-from dataclasses import replace
+from collections.abc import Coroutine
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from typing import Any, cast
 from uuid import uuid4
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import CoreState, HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
@@ -19,7 +22,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util import slugify
 
-from .api import EntergyApiClient, EntergyApiError, EntergyAuthError, EntergyMfaRequired
+from .api import EntergyApiClient, RequestBudget
 from .const import (
     CONF_ACCOUNT_ID,
     CONF_LANGUAGE,
@@ -29,73 +32,239 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import EntergyDataUpdateCoordinator
-from .ledger import EntergyLedger, LedgerRepairError, async_import_legacy_v1_store
-from .models import LedgerMutation
+from .issues import RepairKind, create_issue, delete_issue
+from .ledger import (
+    EntergyLedger,
+    LedgerRepairError,
+    async_import_legacy_v1_store,
+)
+from .models import Credentials, LedgerMutation
 from .statistics import statistic_ids
-
-_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
-def get_coordinator(hass: HomeAssistant, entry: ConfigEntry) -> EntergyDataUpdateCoordinator:
-    """Return coordinator for an entry."""
-    return hass.data[DOMAIN][entry.entry_id]["coordinator"]
+@dataclass(slots=True)
+class EntergyRuntimeData:
+    """Typed runtime objects owned by one config entry."""
+
+    client: EntergyApiClient
+    ledger: EntergyLedger
+    coordinator: EntergyDataUpdateCoordinator
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Entergy from a config entry."""
+type EntergyConfigEntry = ConfigEntry[EntergyRuntimeData]
+
+_RUNTIME_REPAIRS = {
+    RepairKind.LEDGER_CORRUPT,
+    RepairKind.LEDGER_FUTURE,
+    RepairKind.SCHEMA_DRIFT,
+    RepairKind.CURRENCY_MISMATCH,
+    RepairKind.DATA_RETRACTION,
+    RepairKind.BACKFILL_STALLED,
+}
+_CONDITION_TO_REPAIR = {
+    "ledger_repair": RepairKind.LEDGER_CORRUPT,
+    **{kind.value: kind for kind in _RUNTIME_REPAIRS},
+}
+
+
+def _active_runtime_repairs(
+    coordinator: EntergyDataUpdateCoordinator,
+) -> tuple[set[RepairKind], bool]:
+    """Read the coordinator's closed, value-free repair condition set."""
+    diagnostics = coordinator.diagnostics()
+    conditions = diagnostics.get("repair_conditions")
+    active: set[RepairKind] = set()
+    if isinstance(conditions, list):
+        for token in conditions:
+            if isinstance(token, str) and (kind := _CONDITION_TO_REPAIR.get(token)) is not None:
+                active.add(kind)
+    return active, isinstance(diagnostics.get("last_successful_fetch"), str)
+
+
+def _create_active_runtime_issues(
+    hass: HomeAssistant,
+    public_id: str,
+    coordinator: EntergyDataUpdateCoordinator,
+) -> tuple[set[RepairKind], bool]:
+    """Create observed issues without treating a failed poll as proof of repair."""
+    active, has_verified_fetch = _active_runtime_repairs(coordinator)
+    for kind in active:
+        create_issue(hass, public_id, kind)
+    return active, has_verified_fetch
+
+
+def _reconcile_runtime_issues(
+    hass: HomeAssistant,
+    public_id: str,
+    coordinator: EntergyDataUpdateCoordinator,
+) -> None:
+    """Mirror conditions only after the coordinator has verified usable state."""
+    active, has_verified_fetch = _create_active_runtime_issues(hass, public_id, coordinator)
+    if not has_verified_fetch:
+        return
+    for kind in _RUNTIME_REPAIRS:
+        if kind not in active:
+            delete_issue(hass, public_id, kind)
+
+
+def _resolve_verified_ledger_issues(
+    hass: HomeAssistant,
+    public_id: str,
+    ledger: EntergyLedger,
+) -> None:
+    """Clear local ledger repairs only after a verified persisted revision loads."""
+    if ledger.state.revision <= 0:
+        return
+    delete_issue(hass, public_id, RepairKind.LEDGER_CORRUPT)
+    delete_issue(hass, public_id, RepairKind.LEDGER_FUTURE)
+
+
+async def _async_complete_cleanup(
+    cleanup: Coroutine[Any, Any, None],
+    *,
+    name: str,
+) -> None:
+    """Complete ordered cleanup before re-propagating caller cancellation."""
+    cleanup_task = asyncio.create_task(cleanup, name=name)
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as error:
+            if cleanup_task.cancelled():
+                raise
+            cancellation = error
+    cleanup_task.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _async_cleanup_failed_setup(
+    hass: HomeAssistant,
+    entry: EntergyConfigEntry,
+    client: EntergyApiClient,
+    coordinator: EntergyDataUpdateCoordinator | None,
+) -> None:
+    """Finish private cleanup before propagating caller cancellation."""
+
+    async def cleanup() -> None:
+        try:
+            if hasattr(entry, "runtime_data"):
+                with suppress(Exception):
+                    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+            if coordinator is not None:
+                with suppress(Exception):
+                    await coordinator.async_shutdown()
+            try:
+                if client.authenticated:
+                    await client.async_logout(RequestBudget())
+            except Exception:
+                pass
+        finally:
+            with suppress(Exception):
+                client.clear_token()
+            if hasattr(entry, "runtime_data"):
+                with suppress(Exception):
+                    object.__delattr__(entry, "runtime_data")
+
+    await _async_complete_cleanup(cleanup(), name=f"{DOMAIN} failed setup cleanup")
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: EntergyConfigEntry) -> bool:
+    """Set up one entry only after retained privacy migration work is safe."""
     if not await async_recover_migration(hass, entry):
         raise ConfigEntryNotReady("ledger_repair")
-    hass.data.setdefault(DOMAIN, {})
 
-    session = async_get_clientsession(hass)
+    public_id = str(entry.data["public_id"])
+    ledger = EntergyLedger(hass, public_id)
     client = EntergyApiClient(
-        session=session,
-        username=entry.data[CONF_USERNAME],
-        password=entry.data[CONF_PASSWORD],
-        language=entry.data.get(CONF_LANGUAGE, DEFAULT_LANGUAGE),
+        async_get_clientsession(hass),
+        Credentials(
+            str(entry.data[CONF_USERNAME]),
+            str(entry.data[CONF_PASSWORD]),
+        ),
+        language=str(entry.data.get(CONF_LANGUAGE, DEFAULT_LANGUAGE)),
     )
-
+    coordinator: EntergyDataUpdateCoordinator | None = None
     try:
-        await client.async_initialize()
-        await client.async_login()
-    except EntergyMfaRequired as err:
-        raise ConfigEntryAuthFailed(str(err)) from err
-    except EntergyAuthError as err:
-        raise ConfigEntryAuthFailed(str(err)) from err
-    except EntergyApiError as err:
-        raise ConfigEntryNotReady(str(err)) from err
+        coordinator = EntergyDataUpdateCoordinator(
+            hass,
+            entry,
+            client,
+            ledger,
+            time_zone=str(entry.data.get("time_zone") or hass.config.time_zone),
+        )
+        try:
+            await coordinator.async_initialize()
+        except LedgerRepairError as error:
+            kind = RepairKind(error.kind.value)
+            create_issue(hass, public_id, kind)
+            raise ConfigEntryNotReady(kind.value) from None
+        _resolve_verified_ledger_issues(hass, public_id, ledger)
 
-    scan_interval = int(
-        entry.options.get(CONF_SCAN_INTERVAL_SECONDS, DEFAULT_SCAN_INTERVAL_SECONDS)
-    )
+        try:
+            await coordinator.async_config_entry_first_refresh()
+        except BaseException:
+            _create_active_runtime_issues(hass, public_id, coordinator)
+            raise
 
-    coordinator = EntergyDataUpdateCoordinator(
-        hass=hass,
-        client=client,
-        account_id=entry.data[CONF_ACCOUNT_ID],
-        entry_id=entry.entry_id,
-        scan_interval_seconds=scan_interval,
-    )
-    await coordinator.async_initialize()
-    await coordinator.async_config_entry_first_refresh()
+        if ledger.state.revision <= 0:
+            active, _ = _create_active_runtime_issues(hass, public_id, coordinator)
+            for kind in (
+                RepairKind.DATA_RETRACTION,
+                RepairKind.SCHEMA_DRIFT,
+                RepairKind.LEDGER_FUTURE,
+                RepairKind.LEDGER_CORRUPT,
+            ):
+                if kind in active:
+                    raise ConfigEntryNotReady(kind.value)
+            create_issue(hass, public_id, RepairKind.LEDGER_CORRUPT)
+            raise ConfigEntryNotReady(RepairKind.LEDGER_CORRUPT.value)
+        _resolve_verified_ledger_issues(hass, public_id, ledger)
+        if not bool(entry.data.get("ledger_initialized", False)):
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, "ledger_initialized": True},
+            )
+            if entry.data.get("ledger_initialized") is not True:
+                create_issue(hass, public_id, RepairKind.LEDGER_CORRUPT)
+                raise ConfigEntryNotReady(RepairKind.LEDGER_CORRUPT.value)
 
-    hass.data[DOMAIN][entry.entry_id] = {"client": client, "coordinator": coordinator}
-
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        entry.runtime_data = EntergyRuntimeData(client, ledger, coordinator)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        _reconcile_runtime_issues(hass, public_id, coordinator)
+        entry.async_on_unload(
+            coordinator.async_add_listener(
+                lambda: _reconcile_runtime_issues(hass, public_id, coordinator)
+            )
+        )
+        await coordinator.async_start_backfill()
+    except BaseException:
+        await _async_cleanup_failed_setup(hass, entry, client, coordinator)
+        raise
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload an Entergy config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        entry_data = hass.data[DOMAIN].pop(entry.entry_id, None)
-        if entry_data:
-            client: EntergyApiClient = entry_data["client"]
-            await client.async_logout()
-    return unload_ok
+async def async_unload_entry(hass: HomeAssistant, entry: EntergyConfigEntry) -> bool:
+    """Unload entities before stopping work and discarding authentication."""
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
+    runtime = entry.runtime_data
+
+    async def cleanup() -> None:
+        try:
+            await runtime.coordinator.async_shutdown()
+        finally:
+            try:
+                with suppress(Exception):
+                    await runtime.client.async_logout(RequestBudget())
+            finally:
+                runtime.client.clear_token()
+
+    await _async_complete_cleanup(cleanup(), name=f"{DOMAIN} unload cleanup")
+    return True
 
 
 def _migration_issue(hass: HomeAssistant, public_id: str, key: str) -> None:
@@ -136,7 +305,9 @@ def _migrate_registries(
     # Public alias updates only change aliases_v2. HA retains compat_aliases in
     # serialized live/deleted history and exposes no supported scrub operation.
     # Block before any registry mutation rather than finalize with retained PII.
-    if any(unsafe(alias) for item in (*attached, *owned_deleted) for alias in item.compat_aliases):
+    if any(unsafe(alias) for item in attached for alias in item.compat_aliases) or any(
+        unsafe(alias) for item in owned_deleted for alias in item.compat_aliases
+    ):
         raise LedgerRepairError
     # Persist the decision before the first rename; subsequent retries must still
     # rename safe-looking peers after the original offending ID has disappeared.
@@ -242,7 +413,7 @@ def _migrate_registries(
             if key.startswith("new_") or getattr(entity, key) != value
         }
         if changes:
-            entities.async_update_entity(entity.entity_id, **changes)
+            entities.async_update_entity(entity.entity_id, **cast(Any, changes))
     for device in owned_devices:
         devices.async_update_device(
             device.id,

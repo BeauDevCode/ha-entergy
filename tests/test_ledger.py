@@ -13,6 +13,7 @@ from custom_components.entergy_mobile import ledger as api
 from custom_components.entergy_mobile.ledger import (
     EntergyLedger,
     LedgerRepairError,
+    LedgerRepairKind,
     async_import_legacy_v1_store,
 )
 from custom_components.entergy_mobile.models import (
@@ -120,6 +121,7 @@ async def test_future_store_version_never_overwritten(
     ledger = EntergyLedger(hass, PUBLIC_ID)
     with pytest.raises(LedgerRepairError, match="ledger_repair") as error:
         await ledger.async_load(initialized=initialized)
+    assert error.value.kind is LedgerRepairKind.FUTURE
     assert "canary" not in str(error.value)
     result = await ledger.async_ingest(mutation(ledger))
     assert result.deferred and result.repair and result.earliest_statistics_hour is None
@@ -132,8 +134,9 @@ async def test_missing_initialized_or_corrupt_store_blocks(
     ledger = EntergyLedger(hass, PUBLIC_ID)
     before = ledger.state
     # HA reports both a missing file and recovered corrupt JSON as None.
-    with pytest.raises(LedgerRepairError):
+    with pytest.raises(LedgerRepairError) as error:
         await ledger.async_load(initialized=True)
+    assert error.value.kind is LedgerRepairKind.CORRUPT
     assert ledger.state == before
     result = await ledger.async_ingest(mutation(ledger))
     assert result.deferred and result.repair and KEY not in hass_storage
@@ -145,8 +148,14 @@ async def test_corrupt_payload_blocks_even_when_uninitialized(
 ) -> None:
     hass_storage[KEY] = {"version": 2, "data": bad}
     ledger = EntergyLedger(hass, PUBLIC_ID)
-    with pytest.raises(LedgerRepairError):
+    with pytest.raises(LedgerRepairError) as error:
         await ledger.async_load(initialized=False)
+    expected = (
+        LedgerRepairKind.FUTURE
+        if isinstance(bad, dict) and bad.get("schema_version") == 3
+        else LedgerRepairKind.CORRUPT
+    )
+    assert error.value.kind is expected
     assert hass_storage[KEY]["data"] == bad
 
 

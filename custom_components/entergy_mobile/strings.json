@@ -55,17 +55,120 @@
     }
   },
   "issues": {
-    "legacy_entity_id": {
-      "title": "Entity IDs changed for privacy",
-      "description": "Legacy entity IDs were renamed to remove personal information. Update automations, scripts, and dashboards that referenced them."
+    "ledger_corrupt": {
+      "title": "Usage history needs repair",
+      "description": "The private usage history could not be verified. Restore a known-good backup before retrying."
+    },
+    "ledger_future": {
+      "title": "Usage history is from a newer version",
+      "description": "The private usage history was written by a newer integration version. Install a compatible version before retrying."
+    },
+    "schema_drift": {
+      "title": "Entergy data format changed",
+      "description": "The latest utility response could not be validated. The last verified usage data remains available."
+    },
+    "currency_mismatch": {
+      "title": "Cost data is unavailable",
+      "description": "Energy usage remains available, but cost data is hidden until the utility and Home Assistant currencies are both USD."
+    },
+    "data_retraction": {
+      "title": "Unexpected usage revision quarantined",
+      "description": "A large or explicit usage revision was quarantined. The last verified usage history remains unchanged."
     },
     "legacy_energy_source": {
       "title": "Update Energy dashboard sources",
       "description": "Legacy total sensors have been disabled. Select the new Entergy statistics sources in the Energy dashboard. Historical legacy data has not been deleted."
     },
+    "legacy_entity_id": {
+      "title": "Entity IDs changed for privacy",
+      "description": "Legacy entity IDs were renamed to remove personal information. Update automations, scripts, and dashboards that referenced them."
+    },
+    "backfill_stalled": {
+      "title": "Historical usage import is stalled",
+      "description": "Historical usage has not progressed while utility access remains healthy. Current verified data remains available."
+    },
     "ledger_repair": {
       "title": "Usage ledger needs repair",
       "description": "Migration could not verify local usage storage or finish registry updates. Restore a known-good backup and retry. Do not delete usage history."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "newest_interval": {
+        "name": "Newest interval"
+      },
+      "freshness": {
+        "name": "Data freshness",
+        "state": {
+          "fresh": "Fresh",
+          "delayed": "Delayed",
+          "stale": "Stale",
+          "unknown": "Unknown"
+        }
+      },
+      "latest_import": {
+        "name": "Latest interval imported energy"
+      },
+      "today_import": {
+        "name": "Today imported energy"
+      },
+      "seven_day_import": {
+        "name": "Seven-day imported energy"
+      },
+      "month_import": {
+        "name": "Month-to-date imported energy"
+      },
+      "latest_return": {
+        "name": "Latest interval returned energy"
+      },
+      "today_return": {
+        "name": "Today returned energy"
+      },
+      "seven_day_return": {
+        "name": "Seven-day returned energy"
+      },
+      "month_return": {
+        "name": "Month-to-date returned energy"
+      },
+      "latest_cost": {
+        "name": "Latest interval cost"
+      },
+      "today_cost": {
+        "name": "Today cost"
+      },
+      "seven_day_cost": {
+        "name": "Seven-day cost"
+      },
+      "month_cost": {
+        "name": "Month-to-date cost"
+      },
+      "latest_compensation": {
+        "name": "Latest interval compensation"
+      },
+      "today_compensation": {
+        "name": "Today compensation"
+      },
+      "seven_day_compensation": {
+        "name": "Seven-day compensation"
+      },
+      "month_compensation": {
+        "name": "Month-to-date compensation"
+      },
+      "last_successful_fetch": {
+        "name": "Last successful fetch"
+      },
+      "retained_interval_count": {
+        "name": "Retained interval count"
+      },
+      "estimated_interval_count": {
+        "name": "Estimated interval count"
+      },
+      "last_corrected_count": {
+        "name": "Last refresh correction count"
+      },
+      "backfill_progress": {
+        "name": "Historical import progress"
+      }
     }
   }
 }

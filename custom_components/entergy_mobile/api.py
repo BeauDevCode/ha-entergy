@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from email.utils import parsedate_to_datetime
 from enum import Enum
 import json
@@ -15,14 +15,14 @@ import aiohttp
 from .const import API_ORIGIN, DEFAULT_APP_VERSION, DEFAULT_LANGUAGE
 from .errors import (
     AuthError,
-    ChallengeError,
+    ChallengeError as ChallengeError,
     EntergyError,
     ErrorCategory,
     PayloadError,
     PolicyError,
     RateLimitError,
 )
-from .models import Account, ClientMetadata, Credentials, EnergyInterval, LoginResult
+from .models import Account, ClientMetadata, Credentials, EnergyInterval
 from .parser import parse_account, parse_accounts, parse_client_metadata, parse_login, parse_usage
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024
@@ -30,12 +30,6 @@ _TIMEOUT = aiohttp.ClientTimeout(connect=10, sock_read=20, total=30)
 _ACCOUNT_SEGMENT = re.compile(r"[A-Za-z0-9._~-]{1,128}\Z", re.ASCII)
 _DELTA_SECONDS = re.compile(r"-?\d+(?:\.\d+)?\Z", re.ASCII)
 _HEADER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-
-# Internal bridge for v0.1.1 callers. Task 10 removes these aliases and legacy paths.
-EntergyApiError = EntergyError
-EntergyAuthError = AuthError
-EntergyMfaRequired = ChallengeError
-EntergyLoginResult = LoginResult
 
 
 class ApiOperation(Enum):
@@ -69,21 +63,11 @@ class EntergyApiClient:
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        credentials: Credentials | None = None,
+        credentials: Credentials,
         *,
         language: str = DEFAULT_LANGUAGE,
         app_version: str = DEFAULT_APP_VERSION,
-        username: str | None = None,
-        password: str | None = None,
     ) -> None:
-        # Internal, deprecated constructor bridge for v0.1.1 lifecycle/config callers.
-        self._legacy_raw = credentials is None
-        if credentials is None:
-            if username is None or password is None:
-                raise PolicyError from None
-            credentials = Credentials(username, password)
-        elif username is not None or password is not None:
-            raise PolicyError from None
         if (
             not isinstance(language, str)
             or not language
@@ -117,10 +101,6 @@ class EntergyApiClient:
     def clear_token(self) -> None:
         """Discard authentication without making a network request."""
         self._access_token = None
-
-    def _budget(self, budget: RequestBudget | None) -> RequestBudget:
-        # Internal, deprecated optional-budget bridge; new call sites pass one chain budget.
-        return budget if budget is not None else RequestBudget()
 
     def _headers(self, operation: ApiOperation) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -271,17 +251,17 @@ class EntergyApiClient:
         except UnicodeDecodeError, json.JSONDecodeError, ValueError:
             raise PayloadError from None
 
-    async def async_initialize(self, budget: RequestBudget | None = None) -> ClientMetadata:
+    async def async_initialize(self, budget: RequestBudget) -> ClientMetadata:
         """Load client metadata through the bounded transport."""
-        payload = await self._request_json(ApiOperation.APP, self._budget(budget))
+        payload = await self._request_json(ApiOperation.APP, budget)
         result = _parse_reviewed(lambda: parse_client_metadata(payload))
         self._client_id = result.client_id
         return result
 
-    async def async_login(self, budget: RequestBudget | None = None) -> None:
+    async def async_login(self, budget: RequestBudget) -> None:
         """Authenticate once, retaining nothing from any failed login attempt."""
         self.clear_token()
-        chain = self._budget(budget)
+        chain = budget
         if self._client_id is None:
             await self.async_initialize(chain)
         payload = await self._request_json(ApiOperation.LOGIN, chain)
@@ -290,51 +270,45 @@ class EntergyApiClient:
             raise PayloadError from None
         self._access_token = result.access_token
 
-    async def async_logout(self, budget: RequestBudget | None = None) -> None:
+    async def async_logout(self, budget: RequestBudget) -> None:
         """Best-effort logout for an initialized session."""
         try:
             if self._client_id is not None:
-                await self._request_json(ApiOperation.LOGOUT, self._budget(budget))
+                await self._request_json(ApiOperation.LOGOUT, budget)
         except EntergyError:
             pass
         finally:
             self.clear_token()
 
-    async def async_get_accounts(
-        self, budget: RequestBudget | None = None
-    ) -> tuple[Account, ...] | object:
-        """List strictly parsed accounts (legacy constructor returns raw payload)."""
-        payload = await self._request_json(ApiOperation.ACCOUNTS, self._budget(budget))
+    async def async_get_accounts(self, budget: RequestBudget) -> tuple[Account, ...]:
+        """List strictly parsed accounts."""
+        payload = await self._request_json(ApiOperation.ACCOUNTS, budget)
         accounts = _parse_reviewed(lambda: parse_accounts(payload))
         self._account_zones.update(
             {account.account_id: account.time_zone for account in accounts if account.time_zone}
         )
-        return payload if self._legacy_raw else accounts
+        return accounts
 
-    async def async_get_account(
-        self, account_id: str, budget: RequestBudget | None = None
-    ) -> Account | object:
+    async def async_get_account(self, account_id: str, budget: RequestBudget) -> Account:
         """Confirm one account identity."""
-        payload = await self._request_json(
-            ApiOperation.ACCOUNT, self._budget(budget), account_id=account_id
-        )
+        payload = await self._request_json(ApiOperation.ACCOUNT, budget, account_id=account_id)
         account = _parse_reviewed(lambda: parse_account(payload, account_id))
         if account.time_zone:
             self._account_zones[account_id] = account.time_zone
-        return payload if self._legacy_raw else account
+        return account
 
     async def async_get_weekly_usage(
         self,
         account_id: str,
         start_date: date,
-        budget: RequestBudget | None = None,
+        budget: RequestBudget,
         *,
         fallback_time_zone: str = "America/Chicago",
-    ) -> tuple[EnergyInterval, ...] | object:
+    ) -> tuple[EnergyInterval, ...]:
         """Fetch one weekly page and validate at most 512 normalized intervals."""
         payload = await self._request_json(
             ApiOperation.WEEKLY_USAGE,
-            self._budget(budget),
+            budget,
             account_id=account_id,
             start_date=start_date,
         )
@@ -347,15 +321,7 @@ class EntergyApiClient:
         )
         if len(intervals) > 512:
             raise PayloadError from None
-        return payload if self._legacy_raw else intervals
-
-    async def async_fetch_current_usage(
-        self, account_id: str, budget: RequestBudget | None = None
-    ) -> object:
-        """Internal, deprecated six-day wrapper for the v0.1.1 coordinator."""
-        return await self.async_get_weekly_usage(
-            account_id, date.today() - timedelta(days=6), self._budget(budget)
-        )
+        return intervals
 
 
 def _parse_reviewed[T](parser: Callable[[], T]) -> T:

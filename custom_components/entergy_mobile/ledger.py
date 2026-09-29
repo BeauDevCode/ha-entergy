@@ -8,11 +8,12 @@ from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
-from enum import Enum
+from enum import Enum, StrEnum
 from hashlib import sha256
 from typing import Any
 
 from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.exceptions import UnsupportedStorageVersionError
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -163,10 +164,18 @@ def reconcile(
     )
 
 
+class LedgerRepairKind(StrEnum):
+    """Secret-free reason a ledger needs supported repair."""
+
+    CORRUPT = "ledger_corrupt"
+    FUTURE = "ledger_future"
+
+
 class LedgerRepairError(Exception):
     """Setup must block and surface the secret-free ledger repair instruction."""
 
-    def __init__(self) -> None:
+    def __init__(self, kind: LedgerRepairKind = LedgerRepairKind.CORRUPT) -> None:
+        self.kind = kind
         super().__init__(_REPAIR)
 
 
@@ -267,6 +276,9 @@ def _encode(state: LedgerState) -> dict[str, Any]:
 
 def _decode(raw: object) -> LedgerState:
     data = dict(_mapping(raw))
+    schema = data.get("schema_version")
+    if type(schema) is int and schema > _SCHEMA_VERSION:
+        raise LedgerRepairError(LedgerRepairKind.FUTURE)
     fingerprint = data.pop("fingerprint")
     if fingerprint != _fingerprint(data) or _integer(data["schema_version"]) != _SCHEMA_VERSION:
         raise ValueError("invalid ledger fingerprint or schema")
@@ -364,6 +376,12 @@ class EntergyLedger:
                     candidate = self._state
                 else:
                     candidate = _decode(raw)
+            except UnsupportedStorageVersionError:
+                self._blocked = True
+                raise LedgerRepairError(LedgerRepairKind.FUTURE) from None
+            except LedgerRepairError:
+                self._blocked = True
+                raise
             except Exception:
                 self._blocked = True
                 raise LedgerRepairError from None

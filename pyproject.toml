@@ -53,13 +53,3 @@ files = ["custom_components/entergy_mobile", "tests"]
 strict = true
 warn_unused_configs = true
 show_error_codes = true
-
-[[tool.mypy.overrides]]
-module = [
-  "entergy_mobile",
-  "entergy_mobile.config_flow",
-  "entergy_mobile.entity",
-  "entergy_mobile.sensor",
-  "entergy_mobile.diagnostics",
-]
-ignore_errors = true

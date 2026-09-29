@@ -8,7 +8,7 @@ import traceback
 from datetime import UTC, date, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -16,6 +16,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from custom_components.entergy_mobile import api
+from custom_components.entergy_mobile.const import API_ORIGIN
 from custom_components.entergy_mobile.errors import (
     AuthError,
     EntergyError,
@@ -73,11 +74,14 @@ class FakeSession:
         return self.request("POST", url, **kwargs)
 
 
-def client(session: FakeSession) -> api.EntergyApiClient:
-    return api.EntergyApiClient(session, Credentials("secret-user", "secret-password"))
+def client(session: FakeSession | aiohttp.ClientSession) -> api.EntergyApiClient:
+    return api.EntergyApiClient(
+        cast(aiohttp.ClientSession, session),
+        Credentials("secret-user", "secret-password"),
+    )
 
 
-def authenticated(session: FakeSession) -> api.EntergyApiClient:
+def authenticated(session: FakeSession | aiohttp.ClientSession) -> api.EntergyApiClient:
     result = client(session)
     result._client_id = "secret-client"
     result._access_token = "secret"
@@ -178,7 +182,10 @@ async def test_origin_rejects_caller_url_as_operation() -> None:
     session = FakeSession()
     subject = authenticated(session)
     with pytest.raises(PolicyError):
-        await subject._request_json("https://evil.example/api/accounts", api.RequestBudget())
+        await subject._request_json(
+            cast(api.ApiOperation, "https://evil.example/api/accounts"),
+            api.RequestBudget(),
+        )
     assert session.calls == []
 
 
@@ -347,18 +354,10 @@ async def test_auth_failure_is_sanitized() -> None:
     assert "secret" not in str(caught.value) + repr(caught.value)
 
 
-async def test_legacy_constructor_preserves_raw_callers_with_bounded_chain() -> None:
-    session = FakeSession(
-        FakeResponse({"clientId": "client"}),
-        FakeResponse({"token": "token"}),
-        FakeResponse({"accounts": [{"accountId": "a"}]}),
-        FakeResponse(usage(1)),
-    )
-    subject = api.EntergyApiClient(session, username="user", password="password")
-    assert await subject.async_get_accounts() == {"accounts": [{"accountId": "a"}]}
-    raw = await subject.async_fetch_current_usage("a")
-    assert isinstance(raw, dict)
-    assert len(session.calls) == 4
+def test_client_requires_typed_credentials_without_legacy_keywords() -> None:
+    constructor = cast(Any, api.EntergyApiClient)
+    with pytest.raises(TypeError):
+        constructor(FakeSession(), username="user", password="password")
 
 
 async def test_budget_cannot_raise_hard_twelve_request_ceiling() -> None:
@@ -415,7 +414,7 @@ async def test_real_aiohttp_implicit_retry_cannot_send_request_thirteen(
         if middleware_calls == 12:
             response.close()
             raise aiohttp.ServerDisconnectedError()
-        return response
+        return cast(aiohttp.ClientResponse, response)
 
     app = web.Application()
     app.router.add_get("/api/accounts", handler)
@@ -483,7 +482,7 @@ async def test_real_gzip_decoded_limit_releases_response_without_leak(
     app.router.add_get("/api/accounts", handler)
     async with TestServer(app) as server:
         monkeypatch.setattr(api, "API_ORIGIN", str(server.make_url("/")).rstrip("/"))
-        async with aiohttp.ClientSession(trace_configs=(trace,)) as session:
+        async with aiohttp.ClientSession(trace_configs=[trace]) as session:
             with pytest.raises(PayloadError) as caught:
                 await authenticated(session).async_get_accounts(api.RequestBudget())
             assert len(responses) == 1
@@ -512,7 +511,7 @@ async def test_login_uses_reviewed_metadata_and_token_schemas(nested: bool) -> N
     )
     subject = client(session)
     budget = api.RequestBudget()
-    assert await subject.async_login(budget) is None
+    await subject.async_login(budget)
     assert subject.authenticated
     assert await subject.async_get_accounts(budget) == ()
     assert session.calls[1][2]["headers"]["Authorization"] == "Bearer 0"
@@ -580,7 +579,7 @@ async def test_token_plus_unknown_challenge_never_authenticates(
     assert subject.access_token is None
     assert not subject.authenticated
     assert [urlsplit(url).path for _, url, _ in session.calls] == ["/api/app", "/api/login"]
-    assert all(url.startswith(api.API_ORIGIN + "/api/") for _, url, _ in session.calls)
+    assert all(url.startswith(API_ORIGIN + "/api/") for _, url, _ in session.calls)
     assert attacker not in "".join(traceback.format_exception(caught.value)) + caplog.text
 
 
@@ -710,7 +709,7 @@ async def test_logout_success_clears_token_and_requires_new_login() -> None:
         FakeResponse({}), FakeResponse({"token": "replacement"}), FakeResponse({"accounts": []})
     )
     subject = authenticated(session)
-    await subject.async_logout()
+    await subject.async_logout(api.RequestBudget())
     assert not subject.authenticated
     assert await subject.async_get_accounts(api.RequestBudget()) == ()
     assert [urlsplit(url).path for _, url, _ in session.calls] == [
