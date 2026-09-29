@@ -275,7 +275,11 @@ async def test_retry_after_invalid_uses_normal_schedule() -> None:
 
 
 async def test_auth_failure_is_sanitized() -> None:
-    session = FakeSession(FakeResponse({"secret": "secret-body"}, status=401))
+    session = FakeSession(
+        FakeResponse({"secret": "secret-body"}, status=401),
+        FakeResponse({"token": "replacement"}),
+        FakeResponse({"secret": "secret-body"}, status=401),
+    )
     with pytest.raises(AuthError) as caught:
         await authenticated(session).async_get_accounts(api.RequestBudget())
     assert caught.value.status == 401
@@ -434,3 +438,241 @@ async def test_real_gzip_decoded_limit_releases_response_without_leak(
             assert await authenticated(session).async_get_accounts(api.RequestBudget()) == ()
             assert len(responses) == 2
             assert responses[1].closed
+
+
+@pytest.mark.parametrize("nested", [False, True])
+async def test_login_uses_reviewed_metadata_and_token_schemas(nested: bool) -> None:
+    metadata = {"clientId": "synthetic-client"}
+    login = {"accessToken": "synthetic-token"}
+    session = FakeSession(
+        FakeResponse({"data": metadata} if nested else metadata),
+        FakeResponse({"data": login} if nested else login),
+        FakeResponse({"accounts": []}),
+    )
+    subject = client(session)
+    budget = api.RequestBudget()
+    assert await subject.async_login(budget) is None
+    assert subject.authenticated
+    assert await subject.async_get_accounts(budget) == ()
+    assert session.calls[1][2]["headers"]["Authorization"] == "Bearer 0"
+    assert session.calls[1][2]["json"] == {"username": "secret-user", "password": "secret-password"}
+    assert session.calls[2][2]["headers"]["Authorization"] == "Bearer synthetic-token"
+    assert budget.used == 3
+    subject.clear_token()
+    assert not subject.authenticated
+    assert subject.access_token is None
+
+
+@pytest.mark.parametrize(
+    "response,error",
+    [
+        (FakeResponse({}, status=401), AuthError),
+        (FakeResponse({}, status=403), AuthError),
+        (FakeResponse({}), PayloadError),
+        (FakeResponse({"token": 123}), PayloadError),
+        (FakeResponse({"token": "secret\nforged"}), PayloadError),
+        (TimeoutError("secret"), EntergyError),
+    ],
+)
+async def test_login_failure_clears_old_token_without_retry(
+    response: FakeResponse | Exception, error: type[EntergyError]
+) -> None:
+    session = FakeSession(response)
+    subject = authenticated(session)
+    with pytest.raises(error):
+        await subject.async_login(api.RequestBudget())
+    assert subject.access_token is None
+    assert not subject.authenticated
+    assert len(session.calls) == 1
+    assert session.calls[0][2]["headers"]["Authorization"] == "Bearer 0"
+
+
+async def test_login_bad_client_metadata_stops_before_login() -> None:
+    session = FakeSession(FakeResponse({"client_id": "unreviewed"}))
+    subject = client(session)
+    with pytest.raises(PayloadError):
+        await subject.async_get_accounts(api.RequestBudget())
+    assert not subject.authenticated
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("challenge", ["MFA", "CAPTCHA", "consent", "unknown"])
+@pytest.mark.parametrize("token_at_root", [False, True])
+async def test_token_plus_unknown_challenge_never_authenticates(
+    challenge: str, token_at_root: bool, caplog: Any
+) -> None:
+    attacker = "https://attacker.invalid/secret-challenge"
+    action = {"steps": [{"nextAction": {"type": challenge, "url": attacker}}]}
+    payload = (
+        {"token": "secret-token", "data": action}
+        if token_at_root
+        else {"data": {"token": "secret-token"}, "flow": action}
+    )
+    session = FakeSession(
+        FakeResponse({"clientId": "client"}),
+        FakeResponse(payload),
+        FakeResponse({"accounts": []}),
+    )
+    subject = client(session)
+    with pytest.raises(api.ChallengeError) as caught:
+        await subject.async_get_accounts(api.RequestBudget())
+    assert subject.access_token is None
+    assert not subject.authenticated
+    assert [urlsplit(url).path for _, url, _ in session.calls] == ["/api/app", "/api/login"]
+    assert all(url.startswith(api.API_ORIGIN + "/api/") for _, url, _ in session.calls)
+    assert attacker not in "".join(traceback.format_exception(caught.value)) + caplog.text
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("operation", ["accounts", "account", "usage"])
+async def test_authenticated_operation_refreshes_once(status: int, operation: str) -> None:
+    session = FakeSession(
+        FakeResponse({}, status=status),
+        FakeResponse({"token": "replacement"}),
+        FakeResponse(
+            {"accounts": []}
+            if operation == "accounts"
+            else {"accountId": "valid"}
+            if operation == "account"
+            else usage(1)
+        ),
+    )
+    subject = authenticated(session)
+    budget = api.RequestBudget()
+    if operation == "accounts":
+        assert await subject.async_get_accounts(budget) == ()
+    elif operation == "account":
+        assert (await subject.async_get_account("valid", budget)).account_id == "valid"
+    else:
+        assert len(await subject.async_get_weekly_usage("valid", date(2026, 9, 1), budget)) == 1
+    assert subject.authenticated
+    assert budget.used == 3
+    assert [urlsplit(url).path for _, url, _ in session.calls][1] == "/api/login"
+    assert session.calls[0][2]["headers"]["Authorization"] == "Bearer secret"
+    assert session.calls[1][2]["headers"]["Authorization"] == "Bearer 0"
+    assert session.calls[2][2]["headers"]["Authorization"] == "Bearer replacement"
+    assert session.calls[0][1] == session.calls[2][1]
+    assert session.calls[0][2]["params"] == session.calls[2][2]["params"]
+
+
+@pytest.mark.parametrize("second_status", [401, 403])
+async def test_second_auth_failure_clears_token_and_stops(second_status: int) -> None:
+    session = FakeSession(
+        FakeResponse({}, status=401),
+        FakeResponse({"token": "replacement"}),
+        FakeResponse({}, status=second_status),
+    )
+    subject = authenticated(session)
+    with pytest.raises(AuthError) as caught:
+        await subject.async_get_accounts(api.RequestBudget())
+    assert caught.value.status == second_status
+    assert subject.access_token is None
+    assert len(session.calls) == 3
+
+
+async def test_invalid_credentials_during_auth_refresh_never_loop() -> None:
+    session = FakeSession(FakeResponse({}, status=403), FakeResponse({}, status=401))
+    subject = authenticated(session)
+    with pytest.raises(AuthError):
+        await subject.async_get_accounts(api.RequestBudget())
+    assert subject.access_token is None
+    assert [urlsplit(url).path for _, url, _ in session.calls] == ["/api/accounts", "/api/login"]
+
+
+@pytest.mark.parametrize("remaining", [1, 2])
+async def test_request_budget_counts_recursive_auth_and_retries(remaining: int) -> None:
+    session = FakeSession(
+        *(FakeResponse({"accounts": []}) for _ in range(12 - remaining)),
+        FakeResponse({}, status=401),
+        FakeResponse({"token": "replacement"}),
+    )
+    subject = authenticated(session)
+    budget = api.RequestBudget()
+    for _ in range(12 - remaining):
+        await subject.async_get_accounts(budget)
+    with pytest.raises(PolicyError):
+        await subject.async_get_accounts(budget)
+    assert budget.used == 12
+    assert len(session.calls) == 12
+    assert sum(urlsplit(url).path == "/api/login" for _, url, _ in session.calls) <= 1
+    assert subject.access_token is None
+    assert not subject.authenticated
+
+
+@pytest.mark.parametrize("failure", ["transport", "budget", "auth", "uninitialized"])
+async def test_logout_clears_token_even_on_failure(failure: str) -> None:
+    session = FakeSession(
+        FakeResponse({}, status=401) if failure == "auth" else TimeoutError("secret")
+    )
+    subject = authenticated(session)
+    if failure == "uninitialized":
+        subject._client_id = None
+    await subject.async_logout(api.RequestBudget(used=12 if failure == "budget" else 0))
+    assert subject.access_token is None
+    assert not subject.authenticated
+    assert len(session.calls) == (1 if failure in ("auth", "transport") else 0)
+
+
+async def test_challenge_during_auth_refresh_stops_before_account_retry() -> None:
+    session = FakeSession(
+        FakeResponse({}, status=401),
+        FakeResponse({"token": "replacement", "data": {"nextAction": "MFA"}}),
+    )
+    subject = authenticated(session)
+    with pytest.raises(api.ChallengeError):
+        await subject.async_get_accounts(api.RequestBudget())
+    assert subject.access_token is None
+    assert [urlsplit(url).path for _, url, _ in session.calls] == ["/api/accounts", "/api/login"]
+
+
+async def test_invalid_credentials_on_initial_login_prevent_account_call() -> None:
+    session = FakeSession(FakeResponse({"clientId": "client"}), FakeResponse({}, status=401))
+    subject = client(session)
+    with pytest.raises(AuthError):
+        await subject.async_get_accounts(api.RequestBudget())
+    assert not subject.authenticated
+    assert [urlsplit(url).path for _, url, _ in session.calls] == ["/api/app", "/api/login"]
+
+
+async def test_token_is_cleared_when_initialization_fails_during_login() -> None:
+    session = FakeSession(FakeResponse({"clientId": 123}))
+    subject = authenticated(session)
+    subject._client_id = None
+    with pytest.raises(PayloadError):
+        await subject.async_login(api.RequestBudget())
+    assert not subject.authenticated
+    assert len(session.calls) == 1
+
+
+async def test_logout_success_clears_token_and_requires_new_login() -> None:
+    session = FakeSession(
+        FakeResponse({}), FakeResponse({"token": "replacement"}), FakeResponse({"accounts": []})
+    )
+    subject = authenticated(session)
+    await subject.async_logout()
+    assert not subject.authenticated
+    assert await subject.async_get_accounts(api.RequestBudget()) == ()
+    assert [urlsplit(url).path for _, url, _ in session.calls] == [
+        "/api/logout",
+        "/api/login",
+        "/api/accounts",
+    ]
+
+
+async def test_budget_counts_initialization_login_and_failed_auth_recovery() -> None:
+    session = FakeSession(
+        FakeResponse({"clientId": "client"}),
+        FakeResponse({"token": "token"}),
+        FakeResponse({}, status=401),
+    )
+    subject = client(session)
+    budget = api.RequestBudget(used=9)
+    with pytest.raises(PolicyError):
+        await subject.async_get_accounts(budget)
+    assert not subject.authenticated
+    assert budget.used == 12
+    assert [urlsplit(url).path for _, url, _ in session.calls] == [
+        "/api/app",
+        "/api/login",
+        "/api/accounts",
+    ]

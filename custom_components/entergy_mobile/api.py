@@ -109,6 +109,15 @@ class EntergyApiClient:
         """Current access token, if authenticated."""
         return self._access_token
 
+    @property
+    def authenticated(self) -> bool:
+        """Whether a fully validated login token is currently held in memory."""
+        return self._access_token is not None
+
+    def clear_token(self) -> None:
+        """Discard authentication without making a network request."""
+        self._access_token = None
+
     def _budget(self, budget: RequestBudget | None) -> RequestBudget:
         # Internal, deprecated optional-budget bridge; new call sites pass one chain budget.
         return budget if budget is not None else RequestBudget()
@@ -151,11 +160,44 @@ class EntergyApiClient:
                 raise PolicyError from None
         elif start_date is not None:
             raise PolicyError from None
-        if operation in (ApiOperation.ACCOUNTS, ApiOperation.ACCOUNT, ApiOperation.WEEKLY_USAGE):
-            if self._client_id is None:
-                await self.async_initialize(budget)
-            if self._access_token is None:
-                await self.async_login(budget)
+        requires_auth = operation in (
+            ApiOperation.ACCOUNTS,
+            ApiOperation.ACCOUNT,
+            ApiOperation.WEEKLY_USAGE,
+        )
+        if requires_auth and not self.authenticated:
+            await self.async_login(budget)
+        try:
+            return await self._send_json(
+                operation, budget, account_id=account_id, start_date=start_date
+            )
+        except AuthError:
+            self.clear_token()
+            if not requires_auth:
+                raise
+
+        # One recovery only: login and retry spend the original chain budget.
+        recovered = False
+        try:
+            await self.async_login(budget)
+            payload = await self._send_json(
+                operation, budget, account_id=account_id, start_date=start_date
+            )
+            recovered = True
+            return payload
+        finally:
+            if not recovered:
+                self.clear_token()
+
+    async def _send_json(
+        self,
+        operation: ApiOperation,
+        budget: RequestBudget,
+        *,
+        account_id: str | None,
+        start_date: date | None,
+    ) -> object:
+        """Send one validated operation through the fixed transport boundary."""
         method, path = operation.value
         if account_id is not None:
             path = path.replace("{account_id}", account_id)
@@ -236,26 +278,27 @@ class EntergyApiClient:
         self._client_id = result.client_id
         return result
 
-    async def async_login(self, budget: RequestBudget | None = None) -> LoginResult:
-        """Authenticate once; Task 4 owns token refresh policy."""
+    async def async_login(self, budget: RequestBudget | None = None) -> None:
+        """Authenticate once, retaining nothing from any failed login attempt."""
+        self.clear_token()
         chain = self._budget(budget)
         if self._client_id is None:
             await self.async_initialize(chain)
         payload = await self._request_json(ApiOperation.LOGIN, chain)
         result = _parse_reviewed(lambda: parse_login(payload))
+        if _HEADER_CONTROL.search(result.access_token):
+            raise PayloadError from None
         self._access_token = result.access_token
-        return result
 
     async def async_logout(self, budget: RequestBudget | None = None) -> None:
         """Best-effort logout for an initialized session."""
-        if self._client_id is None:
-            return
         try:
-            await self._request_json(ApiOperation.LOGOUT, self._budget(budget))
+            if self._client_id is not None:
+                await self._request_json(ApiOperation.LOGOUT, self._budget(budget))
         except EntergyError:
             pass
         finally:
-            self._access_token = None
+            self.clear_token()
 
     async def async_get_accounts(
         self, budget: RequestBudget | None = None

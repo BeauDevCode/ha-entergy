@@ -213,3 +213,30 @@ def test_extreme_finite_magnitude_has_safe_payload_error(field: str) -> None:
     with pytest.raises(PayloadError) as caught:
         parse(usage(hourly))
     assert rejected not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"token": "secret", "data": {"nextAction": {"type": "MFA"}}},
+        {"token": "secret", "nextAction": "CAPTCHA"},
+        {"token": "secret", "nextAction": "consent"},
+        {"token": "secret", "data": {"steps": [{"nextAction": "unknown"}]}},
+        {"data": {"token": "secret"}, "nextAction": {"url": "https://attacker.invalid"}},
+        {"token": "secret", "data": {"challenge": {"url": "https://attacker.invalid"}}},
+        {"token": "secret", "nextAction": {}},
+        {"token": "secret", "nextAction": []},
+        {"token": "secret", "nextAction": False},
+        {"token": "secret", "nextAction": 0},
+        {"token": "secret", "nextAction": "MFA", "data": None},
+    ],
+)
+def test_login_inspects_all_challenges_before_accepting_token(payload: object) -> None:
+    with pytest.raises(ChallengeError):
+        parse_login(payload)
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": {}}, {"token": ""}, {"token": True}])
+def test_login_requires_nonempty_string_token(payload: object) -> None:
+    with pytest.raises(PayloadError):
+        parse_login(payload)

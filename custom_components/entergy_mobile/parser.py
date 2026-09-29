@@ -215,7 +215,7 @@ def _decimal(value: object) -> Decimal:
         raise PayloadError
     try:
         result = Decimal(str(value))
-    except (InvalidOperation, ValueError, OverflowError):
+    except InvalidOperation, ValueError, OverflowError:
         raise PayloadError from None
     if not result.is_finite():
         raise PayloadError
@@ -243,10 +243,20 @@ def parse_client_metadata(payload: object) -> ClientMetadata:
 def parse_login(payload: object) -> LoginResult:
     """Read a token, failing closed if an interactive action is requested."""
     body = _object(payload)
+    # Inspect the entire JSON tree before token/schema selection. Unknown action
+    # shapes (including false/empty containers) are unsupported, not successful.
+    pending: list[object] = [body]
+    while pending:
+        source = pending.pop()
+        if isinstance(source, dict):
+            for key, value in source.items():
+                if key in ("nextAction", "challenge") and value is not None and value != "":
+                    raise ChallengeError
+                if isinstance(value, (dict, list)):
+                    pending.append(value)
+        elif isinstance(source, list):
+            pending.extend(source)
     nested = _object(body["data"]) if "data" in body else {}
-    for source in (body, nested):
-        if source.get("nextAction"):
-            raise ChallengeError
     token = _pick_string(body, _TOKEN_ALIASES) or _pick_string(nested, _TOKEN_ALIASES)
     if token is None:
         raise PayloadError
