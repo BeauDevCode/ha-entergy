@@ -324,7 +324,12 @@ class EntergyApiClient:
         return payload if self._legacy_raw else account
 
     async def async_get_weekly_usage(
-        self, account_id: str, start_date: date, budget: RequestBudget | None = None
+        self,
+        account_id: str,
+        start_date: date,
+        budget: RequestBudget | None = None,
+        *,
+        fallback_time_zone: str = "America/Chicago",
     ) -> tuple[EnergyInterval, ...] | object:
         """Fetch one weekly page and validate at most 512 normalized intervals."""
         payload = await self._request_json(
@@ -336,7 +341,7 @@ class EntergyApiClient:
         intervals = _parse_reviewed(
             lambda: parse_usage(
                 payload,
-                source_time_zone=self._account_zones.get(account_id, "America/Chicago"),
+                source_time_zone=self._account_zones.get(account_id) or fallback_time_zone,
                 received_at=datetime.now(UTC),
             )
         )

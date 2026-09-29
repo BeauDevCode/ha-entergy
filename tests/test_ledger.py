@@ -487,21 +487,47 @@ async def test_legacy_corrections_do_not_become_invented_baselines(
     new_import: str,
     new_return: str,
 ) -> None:
-    """Generate persisted correction fixtures through the actual old writer."""
-    from custom_components.entergy_mobile.coordinator import EntergyUsageStore, HourlyUsage
-
-    old = EntergyUsageStore(hass, "test-entry")
-    await old.async_load()
-    with patch("custom_components.entergy_mobile.coordinator._utcnow", return_value=HOUR):
-        if historical:
-            await old.async_process(
-                [
-                    HourlyUsage((HOUR - timedelta(days=372)).isoformat(), 10.0, None, False),
-                    HourlyUsage((HOUR - timedelta(days=371)).isoformat(), -4.0, None, False),
-                ]
-            )
-        for usage in updates:
-            await old.async_process([HourlyUsage(HOUR.isoformat(), usage, None, False)])
+    """Import a synthetic v1 correction fixture without legacy runtime helpers."""
+    data: dict[str, Any] = {
+        "total_import_kwh": 10.0 if historical else 0.0,
+        "total_export_kwh": 4.0 if historical else 0.0,
+        "intervals": {},
+    }
+    intervals: dict[str, Any] = data["intervals"]
+    timestamp = HOUR.isoformat()
+    for usage in updates:
+        import_kwh = round(max(usage, 0.0), 6)
+        export_kwh = round(abs(min(usage, 0.0)), 6)
+        existing = intervals.get(timestamp)
+        if existing is None:
+            data["total_import_kwh"] = round(data["total_import_kwh"] + import_kwh, 6)
+            data["total_export_kwh"] = round(data["total_export_kwh"] + export_kwh, 6)
+            intervals[timestamp] = {
+                "usage": usage,
+                "import": import_kwh,
+                "export": export_kwh,
+                "cost": None,
+                "isEstimated": False,
+            }
+            continue
+        old_interval_import = float(existing["import"])
+        old_interval_export = float(existing["export"])
+        data["total_import_kwh"] = round(
+            data["total_import_kwh"] + max(import_kwh - old_interval_import, 0.0), 6
+        )
+        data["total_export_kwh"] = round(
+            data["total_export_kwh"] + max(export_kwh - old_interval_export, 0.0), 6
+        )
+        existing.update(
+            {
+                "usage": usage,
+                "import": max(old_interval_import, import_kwh),
+                "export": max(old_interval_export, export_kwh),
+                "cost": None,
+                "isEstimated": False,
+            }
+        )
+    await Store[dict[str, Any]](hass, 1, LEGACY_KEY).async_save(data)
     before = deepcopy(hass_storage)
     data = before[LEGACY_KEY]["data"]
     assert Decimal(str(data["total_import_kwh"])) == Decimal(old_import)

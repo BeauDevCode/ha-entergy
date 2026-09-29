@@ -242,6 +242,67 @@ async def test_weekly_usage_rejects_513_normalized_intervals() -> None:
         )
 
 
+async def test_weekly_usage_uses_configured_fallback_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "data": {
+            "daily": {
+                "electric": [
+                    {"hourly": [{"date": "2026-09-01T00:00:00", "usage": 1, "isEstimated": False}]}
+                ]
+            }
+        }
+    }
+    observed: list[str] = []
+
+    def parse(*_: Any, source_time_zone: str, received_at: datetime) -> tuple[Any, ...]:
+        observed.append(source_time_zone)
+        return ()
+
+    monkeypatch.setattr(api, "parse_usage", parse)
+    subject = authenticated(FakeSession(FakeResponse(payload)))
+    intervals = await subject.async_get_weekly_usage(
+        "valid",
+        date(2026, 9, 1),
+        api.RequestBudget(),
+        fallback_time_zone="UTC",
+    )
+    assert intervals == ()
+    assert observed == ["UTC"]
+
+
+async def test_reviewed_account_timezone_precedes_configured_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "data": {
+            "daily": {
+                "electric": [
+                    {"hourly": [{"date": "2026-09-01T00:00:00", "usage": 1, "isEstimated": False}]}
+                ]
+            }
+        }
+    }
+    observed: list[str] = []
+
+    def parse(*_: Any, source_time_zone: str, received_at: datetime) -> tuple[Any, ...]:
+        observed.append(source_time_zone)
+        return ()
+
+    monkeypatch.setattr(api, "parse_usage", parse)
+    subject = authenticated(FakeSession(FakeResponse(payload)))
+    subject._account_zones["valid"] = "America/Chicago"
+    intervals = await subject.async_get_weekly_usage(
+        "valid",
+        date(2026, 9, 1),
+        api.RequestBudget(),
+        fallback_time_zone="UTC",
+    )
+    assert intervals == ()
+    assert observed == ["America/Chicago"]
+
+
 async def test_timeout_converts_to_sanitized_transient_error(caplog: Any) -> None:
     session = FakeSession(TimeoutError("secret-timeout-987654"))
     with pytest.raises(EntergyError) as caught:

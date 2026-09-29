@@ -58,7 +58,6 @@ show_error_codes = true
 module = [
   "entergy_mobile",
   "entergy_mobile.config_flow",
-  "entergy_mobile.coordinator",
   "entergy_mobile.entity",
   "entergy_mobile.sensor",
   "entergy_mobile.diagnostics",
