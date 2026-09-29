@@ -274,7 +274,7 @@ def legacy_data() -> dict[str, Any]:
         "intervals": {
             "2026-09-01T10:00:00Z": {
                 "usage": 2.5,
-                "import": 999,
+                "import": 2.5,
                 "export": 0,
                 "cost": 0.25,
                 "isEstimated": False,
@@ -282,7 +282,7 @@ def legacy_data() -> dict[str, Any]:
             "2026-09-01T11:00:00Z": {
                 "usage": -0.75,
                 "import": 0,
-                "export": 999,
+                "export": 0.75,
                 "cost": None,
                 "isEstimated": True,
             },
@@ -458,3 +458,93 @@ async def test_corrupt_json_store_recovery_none_blocks_initialized_ledger(
     result = await ledger.async_ingest(mutation(ledger))
     assert ledger.state is before and result.deferred and result.repair
     assert KEY not in hass_storage
+
+
+@pytest.mark.parametrize(
+    ("updates", "historical", "old_import", "old_return", "new_import", "new_return"),
+    [
+        ([5.0, 2.0], False, "5", "0", "2", "0"),
+        ([5.0, -2.0], False, "5", "2", "0", "2"),
+        ([-5.0, 2.0], False, "2", "5", "2", "0"),
+        ([5.0, 2.0], True, "15", "4", "2", "0"),
+        ([5.0000004, 2.0000004], False, "5", "0", "2.0000004", "0"),
+    ],
+)
+async def test_legacy_corrections_do_not_become_invented_baselines(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    updates: list[float],
+    historical: bool,
+    old_import: str,
+    old_return: str,
+    new_import: str,
+    new_return: str,
+) -> None:
+    """Generate persisted correction fixtures through the actual old writer."""
+    from custom_components.entergy_mobile.coordinator import EntergyUsageStore, HourlyUsage
+
+    old = EntergyUsageStore(hass, "test-entry")
+    await old.async_load()
+    with patch("custom_components.entergy_mobile.coordinator._utcnow", return_value=HOUR):
+        if historical:
+            await old.async_process(
+                [
+                    HourlyUsage((HOUR - timedelta(days=372)).isoformat(), 10.0, None, False),
+                    HourlyUsage((HOUR - timedelta(days=371)).isoformat(), -4.0, None, False),
+                ]
+            )
+        for usage in updates:
+            await old.async_process([HourlyUsage(HOUR.isoformat(), usage, None, False)])
+    before = deepcopy(hass_storage)
+    data = before[LEGACY_KEY]["data"]
+    assert Decimal(str(data["total_import_kwh"])) == Decimal(old_import)
+    assert Decimal(str(data["total_export_kwh"])) == Decimal(old_return)
+    assert len(data["intervals"]) == 1
+    state = await async_import_legacy_v1_store(hass, entry_id="test-entry", public_id=PUBLIC_ID)
+    assert state is not None
+    assert state.baseline == (
+        LedgerTotals(Decimal("10"), Decimal("4")) if historical else LedgerTotals()
+    )
+    assert state.intervals[0].import_kwh == Decimal(new_import)
+    assert state.intervals[0].return_kwh == Decimal(new_return)
+    assert state.intervals[0].amount is None
+    assert hass_storage == before
+
+
+@pytest.mark.parametrize("field", ["import", "export"])
+@pytest.mark.parametrize(
+    "bad", ["missing", None, True, -1, "NaN", "Infinity", {}, "0.0000001", 999]
+)
+async def test_legacy_rejects_missing_or_unsafe_cached_provenance(
+    hass: HomeAssistant, hass_storage: dict[str, Any], field: str, bad: object
+) -> None:
+    data = legacy_data()
+    record = data["intervals"]["2026-09-01T10:00:00Z"]
+    if bad == "missing":
+        record.pop(field)
+    else:
+        record[field] = bad
+    hass_storage[LEGACY_KEY] = {"version": 1, "data": data}
+    before = deepcopy(hass_storage)
+    with pytest.raises(LedgerRepairError, match="ledger_repair"):
+        await async_import_legacy_v1_store(hass, entry_id="test-entry", public_id=PUBLIC_ID)
+    assert hass_storage == before
+
+
+@pytest.mark.parametrize(
+    "field,stamp,bad",
+    [
+        ("import", "2026-09-01T10:00:00Z", 2.0),
+        ("export", "2026-09-01T11:00:00Z", 0.5),
+    ],
+)
+async def test_legacy_rejects_cached_maximum_below_current_signed_usage(
+    hass: HomeAssistant, hass_storage: dict[str, Any], field: str, stamp: str, bad: float
+) -> None:
+    data = legacy_data()
+    data["intervals"][stamp][field] = bad
+    hass_storage[LEGACY_KEY] = {"version": 1, "data": data}
+    before = deepcopy(hass_storage)
+    with pytest.raises(LedgerRepairError, match="ledger_repair"):
+        await async_import_legacy_v1_store(hass, entry_id="test-entry", public_id=PUBLIC_ID)
+    assert hass_storage == before

@@ -303,14 +303,29 @@ class EntergyLedger:
             return await self._persist(LedgerMutation(state))
 
 
+def _legacy_contribution(value: object, current: Decimal) -> Decimal:
+    """Validate a retained hour's cumulative contribution under v1 max accounting."""
+    cached = _decimal(value, legacy=True)
+    # v1 stored maxima of Python float values rounded to six places. Reproduce
+    # only that validation boundary; v2 interval values keep their exact Decimal.
+    if (
+        cached < 0
+        or cached != Decimal(str(round(float(cached), 6)))
+        or cached < Decimal(str(round(float(current), 6)))
+    ):
+        raise ValueError("inconsistent legacy accounting")
+    return cached
+
+
 async def async_import_legacy_v1_store(
     hass: HomeAssistant, *, entry_id: str, public_id: str
 ) -> LedgerState | None:
     """Read v1 signed usage without saving, deleting, or migrating its Store.
 
-    Cached per-interval import/export fields are not authoritative. Lifetime
-    energy minus recomputed retained usage provides the only defensible baseline;
-    historical cost/compensation is unrecoverable and is deliberately omitted.
+    Signed usage supplies the new intervals. Validated cached import/export
+    maxima establish how much retained hours contributed to old lifetime totals;
+    subtract those contributions to isolate pre-window baselines. Historical
+    cost/compensation is unrecoverable and is deliberately omitted.
     The caller persists this candidate through the v2 ledger before marking its
     config entry initialized. public_id identifies that destination, not v1.
     """
@@ -324,17 +339,26 @@ async def async_import_legacy_v1_store(
         data = _mapping(raw)
         received_at = dt_util.utcnow()
         intervals = []
+        contributions = []
         for stamp, raw_item in _mapping(data["intervals"]).items():
             start = _datetime(stamp, legacy=True)
             item = _mapping(raw_item)
             usage = _decimal(item["usage"], legacy=True)
+            import_kwh = max(usage, Decimal(0))
+            return_kwh = usage.copy_negate() if usage < 0 else Decimal(0)
+            contributions.append(
+                (
+                    _legacy_contribution(item["import"], import_kwh),
+                    _legacy_contribution(item["export"], return_kwh),
+                )
+            )
             amount = None if item.get("cost") is None else _decimal(item["cost"], legacy=True)
             intervals.append(
                 EnergyInterval(
                     start=start,
                     end=start + timedelta(hours=1),
-                    import_kwh=max(usage, Decimal(0)),
-                    return_kwh=usage.copy_negate() if usage < 0 else Decimal(0),
+                    import_kwh=import_kwh,
+                    return_kwh=return_kwh,
                     amount=amount,
                     currency=None,
                     is_estimated=_boolean(item["isEstimated"]),
@@ -347,10 +371,13 @@ async def async_import_legacy_v1_store(
         totals = [
             _decimal(data[key], legacy=True) for key in ("total_import_kwh", "total_export_kwh")
         ]
-        # Compute the subtraction exactly even for high precision retained values.
-        values = totals + [
-            value for item in intervals for value in (item.import_kwh, item.return_kwh)
-        ]
+        # v1 never subtracted downward corrections. Removing the cached retained
+        # contributions avoids misclassifying their overcounts as older energy.
+        values = (
+            totals
+            + [value for pair in contributions for value in pair]
+            + [value for item in intervals for value in (item.import_kwh, item.return_kwh)]
+        )
         with localcontext() as context:
             context.prec = max(
                 28,
@@ -362,8 +389,8 @@ async def async_import_legacy_v1_store(
             if context.prec > 4096:
                 raise ValueError("unsafe legacy precision")
             baseline = LedgerTotals(
-                totals[0] - sum((item.import_kwh for item in intervals), Decimal(0)),
-                totals[1] - sum((item.return_kwh for item in intervals), Decimal(0)),
+                totals[0] - sum((pair[0] for pair in contributions), Decimal(0)),
+                totals[1] - sum((pair[1] for pair in contributions), Decimal(0)),
             )
         return LedgerState(
             schema_version=_SCHEMA_VERSION,
