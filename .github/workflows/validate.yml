@@ -4,27 +4,55 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions: {}
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate-hacs:
     name: HACS
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: HACS validation
-        uses: hacs/action@main
+        uses: hacs/action@d556e736723344f83838d08488c983a15381059a # 22.5.0
         with:
           category: integration
 
   hassfest:
     name: Hassfest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Hassfest validation
-        uses: home-assistant/actions/hassfest@master
+        uses: home-assistant/actions/hassfest@06749dd8c0b54f350bc69c8752456cee498808a3 # 2026-09-27
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_VERSION: '8.24.3'
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'

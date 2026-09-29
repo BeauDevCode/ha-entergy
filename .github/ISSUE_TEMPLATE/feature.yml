@@ -1,0 +1,14 @@
+name: Feature request
+description: Propose a reviewed integration change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: 'Do not post passwords, credentials, tokens, account numbers, addresses, production payloads, or Home Assistant runtime files.'
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the use case with synthetic examples and any account-data privacy impact.
+    validations:
+      required: true
