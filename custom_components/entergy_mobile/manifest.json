@@ -1,18 +1,21 @@
 {
   "domain": "entergy_mobile",
-  "name": "Entergy",
+  "name": "Entergy Usage (Unofficial Hardened Fork)",
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
-    "@daviddelahoz"
+    "@BeauDevCode"
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/daviddelahoz/ha-entergy",
+  "documentation": "https://github.com/BeauDevCode/ha-entergy",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/daviddelahoz/ha-entergy/issues",
+  "issue_tracker": "https://github.com/BeauDevCode/ha-entergy/issues",
   "loggers": [
     "custom_components.entergy_mobile"
   ],
   "requirements": [],
-  "version": "0.1.1"
+  "version": "1.0.0-rc.1"
 }

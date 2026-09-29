@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security coordination
+    url: https://github.com/BeauDevCode
+    about: Do not post passwords, credentials, tokens, account numbers, addresses, or production data. Private vulnerability reporting is not enabled yet; ask the maintainer for a private channel.

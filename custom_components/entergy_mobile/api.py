@@ -1,264 +1,360 @@
-"""API client for Entergy."""
+"""Fixed-origin, bounded transport for the reviewed Entergy operations."""
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, timedelta
-import logging
-from typing import Any
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
+from enum import Enum
+import json
+import re
 
 import aiohttp
 
-from .const import (
-    ACCOUNTS_URL,
-    APP_CONFIG_URL,
-    BASE_URL,
-    DEFAULT_APP_VERSION,
-    DEFAULT_LANGUAGE,
-    LOGIN_URL,
-    LOGOUT_URL,
-    WEEKLY_USAGE_URL,
+from .const import API_ORIGIN, DEFAULT_APP_VERSION, DEFAULT_LANGUAGE
+from .errors import (
+    AuthError,
+    ChallengeError as ChallengeError,
+    EntergyError,
+    ErrorCategory,
+    PayloadError,
+    PolicyError,
+    RateLimitError,
 )
+from .models import Account, ClientMetadata, Credentials, EnergyInterval
+from .parser import parse_account, parse_accounts, parse_client_metadata, parse_login, parse_usage
 
-_LOGGER = logging.getLogger(__name__)
-
-
-class EntergyApiError(Exception):
-    """Base Entergy API error."""
-
-
-class EntergyAuthError(EntergyApiError):
-    """Authentication failed or expired."""
+_MAX_BODY_BYTES = 2 * 1024 * 1024
+_TIMEOUT = aiohttp.ClientTimeout(connect=10, sock_read=20, total=30)
+_ACCOUNT_SEGMENT = re.compile(r"[A-Za-z0-9._~-]{1,128}\Z", re.ASCII)
+_DELTA_SECONDS = re.compile(r"-?\d+(?:\.\d+)?\Z", re.ASCII)
+_HEADER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
-class EntergyMfaRequired(EntergyAuthError):
-    """The API requested another authentication action that is not supported."""
+class ApiOperation(Enum):
+    """The complete reviewed V1 method/path set."""
+
+    APP = ("GET", "/api/app")
+    LOGIN = ("POST", "/api/login")
+    LOGOUT = ("POST", "/api/logout")
+    ACCOUNTS = ("GET", "/api/accounts")
+    ACCOUNT = ("GET", "/api/accounts/{account_id}")
+    WEEKLY_USAGE = ("GET", "/api/accounts/{account_id}/weeklyusage")
 
 
-@dataclass
-class EntergyLoginResult:
-    """Login result."""
+@dataclass(slots=True)
+class RequestBudget:
+    """Bound all nested calls in one request chain."""
 
-    access_token: str
-    raw: dict[str, Any]
+    limit: int = 12
+    used: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.limit) is not int
+            or self.limit < 0
+            or type(self.used) is not int
+            or not 0 <= self.used <= min(self.limit, 12)
+        ):
+            raise PolicyError from None
+
+    def consume(self) -> None:
+        """Reserve one network attempt before touching the session."""
+        if self.used >= min(self.limit, 12):
+            raise PolicyError from None
+        self.used += 1
 
 
 class EntergyApiClient:
-    """Small async client for prod.entergy.mindgrb.io."""
+    """Use only fixed operations on the reviewed HTTPS origin."""
 
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        username: str,
-        password: str,
-        app_version: str = DEFAULT_APP_VERSION,
+        credentials: Credentials,
+        *,
         language: str = DEFAULT_LANGUAGE,
-        timeout_seconds: int = 30,
+        app_version: str = DEFAULT_APP_VERSION,
     ) -> None:
+        if (
+            not isinstance(language, str)
+            or not language
+            or not isinstance(app_version, str)
+            or not app_version
+        ):
+            raise PolicyError from None
         self._session = session
-        self._username = username
-        self._password = password
-        self._app_version = app_version
+        self._credentials = credentials
         self._language = language
-        self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        self._app_version = app_version
         self._client_id: str | None = None
         self._access_token: str | None = None
+        self._account_zones: dict[str, str] = {}
 
     @property
     def client_id(self) -> str | None:
-        """Return the current client ID."""
+        """Current reviewed client identifier, if initialized."""
         return self._client_id
 
     @property
     def access_token(self) -> str | None:
-        """Return the current access token."""
+        """Current access token, if authenticated."""
         return self._access_token
 
-    async def async_initialize(self) -> None:
-        """Initialize client metadata required by the Entergy API."""
-        self._client_id = await self.async_get_client_id()
+    @property
+    def authenticated(self) -> bool:
+        """Whether a fully validated login token is currently held in memory."""
+        return self._access_token is not None
 
-    async def async_get_client_id(self) -> str:
-        """Fetch clientId from /api/app."""
-        _LOGGER.debug("Fetching Entergy app config")
-        async with self._session.get(APP_CONFIG_URL, timeout=self._timeout) as resp:
-            body = await self._read_body(resp)
-            if resp.status >= 400:
-                raise EntergyApiError(f"Could not fetch app config: HTTP {resp.status}")
-            if not isinstance(body, dict):
-                raise EntergyApiError("Unexpected app config response")
+    def clear_token(self) -> None:
+        """Discard authentication without making a network request."""
+        self._access_token = None
 
-        client_id = body.get("clientId")
-        if not client_id:
-            data = body.get("data")
-            if isinstance(data, dict):
-                client_id = data.get("clientId")
-        if not client_id:
-            raise EntergyApiError("clientId missing from /api/app response")
-        _LOGGER.debug("Fetched Entergy app config with clientId present")
-        return str(client_id)
-
-    def _params(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-        params: dict[str, Any] = {
-            "appVersion": self._app_version,
-            "language": self._language,
-        }
-        if extra:
-            params.update(extra)
-        return params
-
-    def _headers(self, token: str | None = None) -> dict[str, str]:
-        if not self._client_id:
-            raise EntergyApiError("Client not initialized")
-        bearer = token if token is not None else self._access_token
-        if not bearer:
-            bearer = "0"
-        return {
-            "Accept": "application/json",
-            "clientId": self._client_id,
-            "Authorization": f"Bearer {bearer}",
-        }
-
-    async def _read_body(self, resp: aiohttp.ClientResponse) -> Any:
-        content_type = resp.headers.get("content-type", "")
-        if "json" in content_type:
-            return await resp.json(content_type=None)
-        text = await resp.text()
-        try:
-            return await resp.json(content_type=None)
-        except Exception:
-            return text
-
-    async def async_login(self) -> EntergyLoginResult:
-        """Login and store the returned access token."""
-        if not self._client_id:
-            await self.async_initialize()
-
-        payload = {"username": self._username, "password": self._password}
-        _LOGGER.debug("Logging in to Entergy API")
-
-        async with self._session.post(
-            LOGIN_URL,
-            params=self._params(),
-            headers={**self._headers("0"), "Content-Type": "application/json"},
-            json=payload,
-            timeout=self._timeout,
-        ) as resp:
-            body = await self._read_body(resp)
-            status = resp.status
-
-        if status in (401, 403):
-            raise EntergyAuthError(f"Login failed: HTTP {status}")
-        if status >= 400:
-            raise EntergyApiError(f"Login failed: HTTP {status}: {str(body)[:300]}")
-        if not isinstance(body, dict):
-            raise EntergyApiError("Unexpected login response")
-
-        login_data = body.get("data")
-        if not isinstance(login_data, dict):
-            login_data = body
-
-        next_action = login_data.get("nextAction") or body.get("nextAction")
-        if next_action:
-            raise EntergyMfaRequired(f"Login requires unsupported nextAction: {next_action}")
-
-        token = (
-            login_data.get("accessToken")
-            or login_data.get("access_token")
-            or login_data.get("token")
-            or body.get("accessToken")
-            or body.get("access_token")
-            or body.get("token")
-        )
-        if not token:
-            raise EntergyAuthError("Login response did not contain an access token")
-
-        self._access_token = str(token)
-        _LOGGER.debug("Entergy API login succeeded")
-        return EntergyLoginResult(access_token=self._access_token, raw=body)
-
-    async def async_logout(self) -> None:
-        """Logout best-effort."""
-        if not self._client_id:
-            return
-        try:
-            async with self._session.post(
-                LOGOUT_URL,
-                params=self._params(),
-                headers=self._headers(),
-                timeout=self._timeout,
-            ):
-                pass
-        except Exception as err:
-            _LOGGER.debug("Logout failed: %s", err)
+    def _headers(self, operation: ApiOperation) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if operation is not ApiOperation.APP:
+            if self._client_id is None:
+                raise PolicyError from None
+            bearer = self._access_token or "0"
+            if _HEADER_CONTROL.search(self._client_id) or _HEADER_CONTROL.search(bearer):
+                raise PayloadError from None
+            headers["clientId"] = self._client_id
+            headers["Authorization"] = f"Bearer {bearer}"
+        return headers
 
     async def _request_json(
         self,
-        method: str,
-        url: str,
+        operation: ApiOperation,
+        budget: RequestBudget,
         *,
-        params: dict[str, Any] | None = None,
-        retry_auth: bool = True,
-    ) -> Any:
-        if not self._client_id:
-            await self.async_initialize()
-        if not self._access_token:
-            await self.async_login()
+        account_id: str | None = None,
+        start_date: date | None = None,
+    ) -> object:
+        """Issue one allowlisted request and read at most 2 MiB of decoded JSON."""
+        if not isinstance(operation, ApiOperation):
+            raise PolicyError from None
+        if operation in (ApiOperation.ACCOUNT, ApiOperation.WEEKLY_USAGE):
+            if (
+                not isinstance(account_id, str)
+                or not _ACCOUNT_SEGMENT.fullmatch(account_id)
+                or ".." in account_id
+                or account_id == "."
+            ):
+                raise PolicyError from None
+        elif account_id is not None:
+            raise PolicyError from None
+        if operation is ApiOperation.WEEKLY_USAGE:
+            if not isinstance(start_date, date) or isinstance(start_date, datetime):
+                raise PolicyError from None
+        elif start_date is not None:
+            raise PolicyError from None
+        requires_auth = operation in (
+            ApiOperation.ACCOUNTS,
+            ApiOperation.ACCOUNT,
+            ApiOperation.WEEKLY_USAGE,
+        )
+        if requires_auth and not self.authenticated:
+            await self.async_login(budget)
+        try:
+            return await self._send_json(
+                operation, budget, account_id=account_id, start_date=start_date
+            )
+        except AuthError:
+            self.clear_token()
+            if not requires_auth:
+                raise
 
-        _LOGGER.debug("Requesting Entergy API: %s %s", method, url)
-        async with self._session.request(
-            method,
-            url,
-            params=self._params(params),
-            headers=self._headers(),
-            timeout=self._timeout,
-        ) as resp:
-            body = await self._read_body(resp)
-            status = resp.status
+        # One recovery only: login and retry spend the original chain budget.
+        recovered = False
+        try:
+            await self.async_login(budget)
+            payload = await self._send_json(
+                operation, budget, account_id=account_id, start_date=start_date
+            )
+            recovered = True
+            return payload
+        finally:
+            if not recovered:
+                self.clear_token()
 
-        if status == 401 and retry_auth:
-            _LOGGER.debug("Entergy API returned 401; refreshing login and retrying")
-            await self.async_login()
-            return await self._request_json(method, url, params=params, retry_auth=False)
+    async def _send_json(
+        self,
+        operation: ApiOperation,
+        budget: RequestBudget,
+        *,
+        account_id: str | None,
+        start_date: date | None,
+    ) -> object:
+        """Send one validated operation through the fixed transport boundary."""
+        method, path = operation.value
+        if account_id is not None:
+            path = path.replace("{account_id}", account_id)
+        params = {"appVersion": self._app_version, "language": self._language}
+        if operation is ApiOperation.WEEKLY_USAGE:
+            assert start_date is not None
+            params.update({"view": "day", "startDate": start_date.isoformat()})
+        headers = self._headers(operation)
+        if operation is ApiOperation.LOGIN:
+            headers["Content-Type"] = "application/json"
+        budget.consume()
+        attempts = 0
 
-        if status in (401, 403):
-            raise EntergyAuthError(f"Unauthorized: HTTP {status}")
-        if status >= 400:
-            raise EntergyApiError(f"API request failed: HTTP {status}: {str(body)[:300]}")
-        return body
+        async def count_attempt(
+            request: aiohttp.ClientRequest,
+            handler: Callable[[aiohttp.ClientRequest], Awaitable[aiohttp.ClientResponse]],
+        ) -> aiohttp.ClientResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                budget.consume()
+            return await handler(request)
 
-    async def async_get_accounts(self) -> Any:
-        """Fetch the user's accounts."""
-        return await self._request_json("GET", ACCOUNTS_URL)
+        # aiohttp per-request middleware replaces the session list, so compose explicitly.
+        # Placing this innermost counts retries made by session middleware too.
+        session_middlewares = getattr(self._session, "_middlewares", ()) or ()
+        try:
+            async with self._session.request(
+                method,
+                API_ORIGIN + path,
+                params=params,
+                headers=headers,
+                json={
+                    "username": self._credentials.username,
+                    "password": self._credentials.password,
+                }
+                if operation is ApiOperation.LOGIN
+                else None,
+                timeout=_TIMEOUT,
+                allow_redirects=False,
+                auto_decompress=True,
+                middlewares=(*session_middlewares, count_attempt),
+            ) as response:
+                status = response.status
+                if 300 <= status < 400:
+                    raise PolicyError from None
+                if status in (401, 403):
+                    raise AuthError(status) from None
+                if status == 429:
+                    raise RateLimitError(
+                        status, _retry_after(response.headers.get("Retry-After"))
+                    ) from None
+                if status >= 400:
+                    raise EntergyError(ErrorCategory.TRANSIENT, status) from None
+                media_type = (
+                    response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                )
+                if media_type != "application/json" and not (
+                    media_type.startswith("application/") and media_type.endswith("+json")
+                ):
+                    raise PayloadError from None
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    if len(body) + len(chunk) > _MAX_BODY_BYTES:
+                        raise PayloadError from None
+                    body.extend(chunk)
+        except TimeoutError, aiohttp.ClientError, OSError, ValueError:
+            raise EntergyError(ErrorCategory.TRANSIENT) from None
+        try:
+            return json.loads(body)
+        except UnicodeDecodeError, json.JSONDecodeError, ValueError:
+            raise PayloadError from None
 
-    async def async_get_account(self, account_id: str) -> Any:
-        """Fetch one account."""
-        return await self._request_json("GET", f"{ACCOUNTS_URL}/{account_id}")
+    async def async_initialize(self, budget: RequestBudget) -> ClientMetadata:
+        """Load client metadata through the bounded transport."""
+        payload = await self._request_json(ApiOperation.APP, budget)
+        result = _parse_reviewed(lambda: parse_client_metadata(payload))
+        self._client_id = result.client_id
+        return result
+
+    async def async_login(self, budget: RequestBudget) -> None:
+        """Authenticate once, retaining nothing from any failed login attempt."""
+        self.clear_token()
+        chain = budget
+        if self._client_id is None:
+            await self.async_initialize(chain)
+        payload = await self._request_json(ApiOperation.LOGIN, chain)
+        result = _parse_reviewed(lambda: parse_login(payload))
+        if _HEADER_CONTROL.search(result.access_token):
+            raise PayloadError from None
+        self._access_token = result.access_token
+
+    async def async_logout(self, budget: RequestBudget) -> None:
+        """Best-effort logout for an initialized session."""
+        try:
+            if self._client_id is not None:
+                await self._request_json(ApiOperation.LOGOUT, budget)
+        except EntergyError:
+            pass
+        finally:
+            self.clear_token()
+
+    async def async_get_accounts(self, budget: RequestBudget) -> tuple[Account, ...]:
+        """List strictly parsed accounts."""
+        payload = await self._request_json(ApiOperation.ACCOUNTS, budget)
+        accounts = _parse_reviewed(lambda: parse_accounts(payload))
+        self._account_zones.update(
+            {account.account_id: account.time_zone for account in accounts if account.time_zone}
+        )
+        return accounts
+
+    async def async_get_account(self, account_id: str, budget: RequestBudget) -> Account:
+        """Confirm one account identity."""
+        payload = await self._request_json(ApiOperation.ACCOUNT, budget, account_id=account_id)
+        account = _parse_reviewed(lambda: parse_account(payload, account_id))
+        if account.time_zone:
+            self._account_zones[account_id] = account.time_zone
+        return account
 
     async def async_get_weekly_usage(
         self,
         account_id: str,
         start_date: date,
-        view: str = "day",
-    ) -> Any:
-        """Fetch weekly usage payload for an account."""
-        url = WEEKLY_USAGE_URL.format(account_id=account_id)
-        return await self._request_json(
-            "GET",
-            url,
-            params={"view": view, "startDate": start_date.isoformat()},
-        )
-
-    async def async_fetch_current_usage(self, account_id: str) -> Any:
-        """Fetch the latest usage window."""
-        today = date.today()
-        return await self.async_get_weekly_usage(
+        budget: RequestBudget,
+        *,
+        fallback_time_zone: str = "America/Chicago",
+    ) -> tuple[EnergyInterval, ...]:
+        """Fetch one weekly page and validate at most 512 normalized intervals."""
+        payload = await self._request_json(
+            ApiOperation.WEEKLY_USAGE,
+            budget,
             account_id=account_id,
-            start_date=today - timedelta(days=6),
-            view="day",
+            start_date=start_date,
         )
+        intervals = _parse_reviewed(
+            lambda: parse_usage(
+                payload,
+                source_time_zone=self._account_zones.get(account_id) or fallback_time_zone,
+                received_at=datetime.now(UTC),
+            )
+        )
+        if len(intervals) > 512:
+            raise PayloadError from None
+        return intervals
 
-    def absolute_url(self, path: str) -> str:
-        """Return an absolute API URL for diagnostics/tests."""
-        path = path.lstrip("/")
-        return f"{BASE_URL}/{path}"
+
+def _parse_reviewed[T](parser: Callable[[], T]) -> T:
+    """Keep unanticipated data-derived parser failures value-free at the API edge."""
+    try:
+        return parser()
+    except EntergyError:
+        raise
+    except Exception:
+        raise PayloadError from None
+
+
+def _retry_after(value: str | None) -> float | None:
+    """Parse a delta or HTTP date without exposing the server-supplied text."""
+    if value is None:
+        return None
+    if _DELTA_SECONDS.fullmatch(value):
+        # The ASCII decimal grammar guarantees float conversion; arbitrarily
+        # large magnitudes become infinity and are clamped by the same bounds.
+        return min(max(float(value), 0.0), 86400.0)
+    try:
+        target = parsedate_to_datetime(value)
+        if target.tzinfo is None:
+            return None
+        return min(max((target - datetime.now(UTC)).total_seconds(), 0.0), 86400.0)
+    except TypeError, ValueError, OverflowError:
+        return None

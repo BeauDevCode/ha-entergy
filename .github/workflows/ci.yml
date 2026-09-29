@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.12.19'
+      - run: uv sync --frozen
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy --explicit-package-bases custom_components/entergy_mobile
+
+  current-tests:
+    name: Current tests (HA 2026.9.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.12.19'
+      - run: uv sync --frozen
+      - run: uv run pytest -q --cov=custom_components.entergy_mobile --cov-branch --cov-report=json:coverage.json --cov-fail-under=95
+      - run: uv run python scripts/check_coverage.py coverage.json
+
+  minimum-tests:
+    name: Minimum tests (HA 2026.9.3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.12.19'
+      - run: uv venv --python 3.14 .venv-min
+      - run: uv pip sync --python .venv-min/bin/python requirements/ha-2026.9.3.txt
+      - run: .venv-min/bin/python -m pytest -q --cov=custom_components.entergy_mobile --cov-branch --cov-report=json:coverage-min.json --cov-fail-under=95
+      - run: .venv-min/bin/python scripts/check_coverage.py coverage-min.json
+
+  dependency-audit:
+    name: Dependency audit (HA ${{ matrix.homeassistant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        homeassistant: ['2026.9.3', '2026.9.4']
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: '0.12.19'
+      - run: uv sync --frozen
+      - name: Sync minimum environment
+        if: matrix.homeassistant == '2026.9.3'
+        run: |
+          uv venv --python 3.14 .venv-min
+          uv pip sync --python .venv-min/bin/python requirements/ha-2026.9.3.txt
+      - name: Audit current with expiring upstream exception
+        if: matrix.homeassistant == '2026.9.4'
+        run: uv run python scripts/check_dependency_audit.py 2026.9.4
+      - name: Audit minimum with expiring upstream exception
+        if: matrix.homeassistant == '2026.9.3'
+        run: .venv-min/bin/python scripts/check_dependency_audit.py 2026.9.3

@@ -1,5 +1,17 @@
 __pycache__/
 *.py[cod]
+.venv/
+.venv-*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage*.json
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Local handoff / agent context files
 SKILL*.md
@@ -14,7 +26,28 @@ entergy_mobile_ha_handoff_summary.md
 *.zip
 *.har
 *.pcap
+*.pcapng
+*.db
+*.sqlite
+*.sqlite3
 *.log
+*.mp4
+*.mov
+*.m4a
+*.wav
+*.heic
+*.jpg
+*.jpeg
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+secrets.yaml
+known_devices.yaml
+.storage/
+.HA_VERSION
 
 # Local editor and OS files
 .DS_Store

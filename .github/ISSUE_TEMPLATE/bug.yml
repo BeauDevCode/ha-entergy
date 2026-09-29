@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a reproducible integration defect
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 'Do not post passwords, credentials, tokens, account numbers, addresses, production payloads, or Home Assistant runtime files. Security reports belong in SECURITY.md.'
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Exact integration, Home Assistant, and Python versions.
+    validations:
+      required: true
+  - type: textarea
+    id: symptoms
+    attributes:
+      label: Sanitized symptoms and synthetic reproduction
+      description: Describe what happened using synthetic data and redacted diagnostics only.
+    validations:
+      required: true
