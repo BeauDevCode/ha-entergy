@@ -391,9 +391,10 @@ async def test_real_gzip_decoded_limit_releases_response_without_leak(
     monkeypatch: Any, caplog: Any, socket_enabled: None
 ) -> None:
     sentinel = "secret-gzip-body-987654"
-    decoded = (sentinel * 140000).encode()
+    decoded = json.dumps({"accounts": [], "padding": sentinel * 140000}).encode()
     compressed = gzip.compress(decoded)
     assert len(compressed) < 2 * 1024 * 1024 < len(decoded)
+    assert len(compressed) > 2048
     responses: list[aiohttp.ClientResponse] = []
     trace = aiohttp.TraceConfig()
 
@@ -402,11 +403,16 @@ async def test_real_gzip_decoded_limit_releases_response_without_leak(
 
     trace.on_request_end.append(saw_response)
 
-    async def handler(_: web.Request) -> web.Response:
-        return web.Response(
-            body=compressed,
-            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+    async def handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(
+            headers={"Content-Encoding": "gzip", "Content-Type": "application/json"}
         )
+        response.enable_chunked_encoding()
+        await response.prepare(request)
+        for offset in range(0, len(compressed), 1024):
+            await response.write(compressed[offset : offset + 1024])
+        await response.write_eof()
+        return response
 
     app = web.Application()
     app.router.add_get("/api/accounts", handler)
@@ -416,8 +422,15 @@ async def test_real_gzip_decoded_limit_releases_response_without_leak(
             with pytest.raises(PayloadError) as caught:
                 await authenticated(session).async_get_accounts(api.RequestBudget())
             assert len(responses) == 1
+            assert responses[0].headers["Transfer-Encoding"] == "chunked"
+            assert "Content-Length" not in responses[0].headers
             assert responses[0].closed
             exposed = (
                 "".join(traceback.format_exception(caught.value)) + repr(caught.value) + caplog.text
             )
             assert sentinel not in exposed
+
+            monkeypatch.setattr(api, "_MAX_BODY_BYTES", len(decoded))
+            assert await authenticated(session).async_get_accounts(api.RequestBudget()) == ()
+            assert len(responses) == 2
+            assert responses[1].closed
