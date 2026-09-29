@@ -378,3 +378,32 @@ async def test_empty_queue_has_no_commit_claim_or_boundary(hass: HomeAssistant) 
     result = await async_queue_external_statistics(hass, ())
     assert result.row_count == 0 and result.statistic_ids == () and result.through is None
     assert result.fingerprint == statistics_fingerprint(())
+
+
+@pytest.mark.parametrize(
+    "currency,cost,compensation",
+    [("USD", 8, 2), (None, 8, 2), ("EUR", 1, 0)],
+)
+def test_pruned_non_usd_amounts_never_reappear_as_usd_statistics(
+    currency: str | None,
+    cost: int,
+    compensation: int,
+) -> None:
+    now = HOUR + timedelta(days=401)
+    recent = now - timedelta(hours=1)
+    state = LedgerState(
+        intervals=(
+            interval(amount="7", currency=currency),
+            interval(NEXT, amount="-2", currency=currency),
+            interval(recent, amount="1"),
+        )
+    )
+    before = build(state)
+    assert len(before) == (2 if currency == "EUR" else 4)
+    pruned = reconcile(state, (), received_at=now).state
+    assert len(pruned.intervals) == 1
+    batches = {meta["statistic_id"]: rows for meta, rows in build(pruned)}
+    assert batches[IDS.consumption] == ({"start": recent, "state": 4.0, "sum": 12.0},)
+    assert batches[IDS.return_] == ({"start": recent, "state": 1.0, "sum": 3.0},)
+    assert batches[IDS.cost] == ({"start": recent, "state": 1.0, "sum": cost},)
+    assert batches[IDS.compensation] == ({"start": recent, "state": 0.0, "sum": compensation},)

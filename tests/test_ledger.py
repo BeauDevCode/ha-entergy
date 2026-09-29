@@ -841,3 +841,29 @@ def test_reconcile_exact_totals_ignore_active_exponent_limits() -> None:
         ctx.traps[Inexact] = True
         totals = api.cumulative_totals(state)
     assert totals[0][1].import_kwh == Decimal("12345.00000000012346")
+
+
+@pytest.mark.parametrize(
+    "currency,cost,compensation",
+    [("USD", "10", "3"), (None, "10", "3"), ("EUR", "3", "1")],
+)
+def test_retention_baselines_include_only_usd_or_omitted_source_currency(
+    currency: str | None,
+    cost: str,
+    compensation: str,
+) -> None:
+    state = LedgerState(
+        intervals=(
+            replace(hour_record(0), return_kwh=Decimal(2), amount=Decimal(7), currency=currency),
+            replace(hour_record(1), return_kwh=Decimal(2), amount=Decimal(-2), currency=currency),
+        ),
+        baseline=LedgerTotals(Decimal(10), Decimal(5), Decimal(3), Decimal(1)),
+    )
+    pruned = api.reconcile(state, (), received_at=HOUR + timedelta(days=401)).state
+    assert pruned.intervals == ()
+    assert pruned.baseline == LedgerTotals(
+        Decimal(12),
+        Decimal(9),
+        Decimal(cost),
+        Decimal(compensation),
+    )

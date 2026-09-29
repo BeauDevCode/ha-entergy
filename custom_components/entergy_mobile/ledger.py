@@ -46,7 +46,11 @@ def _exact_sum(values: Iterable[Decimal]) -> Decimal:
 
 
 def _add_interval(totals: LedgerTotals, item: EnergyInterval) -> LedgerTotals:
-    amount = item.amount if item.amount is not None else Decimal(0)
+    # Baselines discard source provenance, so they must never absorb foreign
+    # currency. Use the same eligible contributions for retained running totals.
+    amount = (
+        item.amount if item.amount is not None and item.currency in (None, "USD") else Decimal(0)
+    )
     return LedgerTotals(
         _exact_sum((totals.import_kwh, item.import_kwh)),
         _exact_sum((totals.return_kwh, item.return_kwh)),
