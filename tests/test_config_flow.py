@@ -8,13 +8,15 @@ from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import pytest
-from custom_components.entergy_mobile.config_flow import _user_schema
+import voluptuous as vol
+from custom_components.entergy_mobile.config_flow import EntergyMobileConfigFlow, _user_schema
 from custom_components.entergy_mobile.const import DOMAIN
 from custom_components.entergy_mobile.errors import AuthError, ChallengeError
 from custom_components.entergy_mobile.models import Account
 from custom_components.entergy_mobile.statistics import statistic_ids
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER, ConfigFlowResult
 from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import InvalidData
 from homeassistant.helpers import selector
 from pytest_homeassistant_custom_component import common  # type: ignore[import-untyped]
 
@@ -96,6 +98,81 @@ async def test_create_private_identity(hass: HomeAssistant, client: AsyncMock) -
     assert entry.version == 2 and entry.minor_version == 1
     assert entry.options["scan_interval_seconds"] == 14400
     await hass.async_block_till_done()
+
+
+async def test_missing_account_zone_requires_visible_defaulted_timezone(
+    hass: HomeAssistant, client: AsyncMock
+) -> None:
+    client.async_get_accounts.return_value = (Account("987654321"),)
+    hass.config.time_zone = "America/New_York"
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"account_id": "0"})
+    assert result["type"] == "form" and result["step_id"] == "time_zone"
+    assert result["data_schema"]({}) == {"time_zone": "America/New_York"}
+    marker, field = next(iter(result["data_schema"].schema.items()))
+    assert isinstance(marker, vol.Required)
+    assert isinstance(field, selector.SelectSelector)
+    assert "America/New_York" in field.config["options"]
+    for path in ("strings.json", "translations/en.json"):
+        strings = json.loads(Path("custom_components/entergy_mobile", path).read_text())
+        assert strings["config"]["step"]["time_zone"]["data"]["time_zone"]
+        assert strings["config"]["error"]["invalid_time_zone"]
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] == "create_entry"
+    assert result["result"].data["time_zone"] == "America/New_York"
+
+
+async def test_timezone_pause_rechecks_private_account_duplicate(
+    hass: HomeAssistant, client: AsyncMock
+) -> None:
+    client.async_get_accounts.return_value = (Account("987654321"),)
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"account_id": "0"})
+    common.MockConfigEntry(
+        domain=DOMAIN, unique_id="b" * 32, data={"account_id": "987654321"}
+    ).add_to_hass(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"time_zone": "America/Chicago"}
+    )
+    assert result["type"] == "abort" and result["reason"] == "already_configured"
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+
+
+async def test_missing_account_zone_accepts_valid_override(
+    hass: HomeAssistant, client: AsyncMock
+) -> None:
+    client.async_get_accounts.return_value = (Account("987654321"),)
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"account_id": "0"})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"time_zone": "America/Denver"}
+    )
+    assert result["type"] == "create_entry"
+    assert result["result"].data["time_zone"] == "America/Denver"
+
+
+async def test_missing_account_zone_rejects_invalid_without_secrets(
+    hass: HomeAssistant, client: AsyncMock
+) -> None:
+    client.async_get_accounts.return_value = (Account("987654321"),)
+    result = await start(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"account_id": "0"})
+    with pytest.raises(InvalidData) as error:
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"time_zone": "private-canary/NotAZone"}
+        )
+    assert "private-canary" not in str(error.value)
+    assert not hass.config_entries.async_entries(DOMAIN)
+
+
+async def test_timezone_handler_defensively_rejects_invalid_value(hass: HomeAssistant) -> None:
+    flow = EntergyMobileConfigFlow()
+    flow.hass = hass
+    flow._selected_account = Account("987654321")
+    result = await flow.async_step_time_zone({"time_zone": "private-canary/NotAZone"})
+    assert result["step_id"] == "time_zone"
+    assert result["errors"] == {"time_zone": "invalid_time_zone"}
+    assert "private-canary" not in repr(result["errors"])
 
 
 async def test_duplicate_checks_private_account(hass: HomeAssistant, client: AsyncMock) -> None:

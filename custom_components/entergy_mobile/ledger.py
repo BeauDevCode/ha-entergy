@@ -7,7 +7,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
+from decimal import Decimal
 from enum import Enum, StrEnum
 from hashlib import sha256
 from typing import Any
@@ -17,7 +17,8 @@ from homeassistant.exceptions import UnsupportedStorageVersionError
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .models import EnergyInterval, LedgerMutation, LedgerState, LedgerTotals
+from .models import EnergyInterval, LedgerMutation, LedgerState, LedgerTotals, validate_decimal
+from .models import exact_sum as _exact_sum
 
 _SCHEMA_VERSION = 2
 _REPAIR = "ledger_repair"
@@ -28,22 +29,6 @@ class _Unchanged(Enum):
 
 
 UNCHANGED = _Unchanged.VALUE
-
-
-def _exact_sum(values: Iterable[Decimal]) -> Decimal:
-    """Sum finite values exactly, independently of the caller's Decimal context."""
-    items = tuple(values)
-    if not items:
-        return Decimal(0)
-    precision = max(
-        1,
-        max(item.adjusted() for item in items)
-        - min(int(item.as_tuple().exponent) for item in items)
-        + len(str(len(items)))
-        + 2,
-    )
-    with localcontext(Context(prec=precision, Emax=MAX_EMAX, Emin=MIN_EMIN)):
-        return sum(items, Decimal(0))
 
 
 def _add_interval(totals: LedgerTotals, item: EnergyInterval) -> LedgerTotals:
@@ -203,12 +188,13 @@ def _text(value: object) -> str | None:
     return value
 
 
-def _decimal(value: object, *, legacy: bool = False) -> Decimal:
+def _decimal(value: object, *, legacy: bool = False, derived: bool = False) -> Decimal:
     if isinstance(value, bool) or not isinstance(value, (str, int, float) if legacy else str):
         raise ValueError("invalid ledger decimal")
     result = Decimal(str(value))
     if not result.is_finite():
         raise ValueError("invalid ledger decimal")
+    validate_decimal(result, derived=derived)
     return result
 
 
@@ -306,7 +292,7 @@ def _decode(raw: object) -> LedgerState:
         intervals=tuple(sorted(intervals, key=lambda item: item.start)),
         baseline=LedgerTotals(
             *(
-                _decimal(baseline[key])
+                _decimal(baseline[key], derived=True)
                 for key in ("import_kwh", "return_kwh", "cost", "compensation")
             )
         ),
@@ -530,29 +516,15 @@ async def async_import_legacy_v1_store(
         if len({item.start for item in intervals}) != len(intervals):
             raise ValueError("duplicate legacy hour")
         totals = [
-            _decimal(data[key], legacy=True) for key in ("total_import_kwh", "total_export_kwh")
+            _decimal(data[key], legacy=True, derived=True)
+            for key in ("total_import_kwh", "total_export_kwh")
         ]
         # v1 never subtracted downward corrections. Removing the cached retained
         # contributions avoids misclassifying their overcounts as older energy.
-        values = (
-            totals
-            + [value for pair in contributions for value in pair]
-            + [value for item in intervals for value in (item.import_kwh, item.return_kwh)]
+        baseline = LedgerTotals(
+            _exact_sum((totals[0], *(pair[0].copy_negate() for pair in contributions))),
+            _exact_sum((totals[1], *(pair[1].copy_negate() for pair in contributions))),
         )
-        with localcontext() as context:
-            context.prec = max(
-                28,
-                max(value.adjusted() for value in values)
-                - min(int(value.as_tuple().exponent) for value in values)
-                + len(str(len(values)))
-                + 2,
-            )
-            if context.prec > 4096:
-                raise ValueError("unsafe legacy precision")
-            baseline = LedgerTotals(
-                totals[0] - sum((pair[0] for pair in contributions), Decimal(0)),
-                totals[1] - sum((pair[1] for pair in contributions), Decimal(0)),
-            )
         return LedgerState(
             schema_version=_SCHEMA_VERSION,
             intervals=tuple(intervals),

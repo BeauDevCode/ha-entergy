@@ -2,11 +2,49 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, localcontext
 from enum import StrEnum
 from hashlib import sha256
+from math import isfinite
+
+
+def validate_decimal(value: Decimal, *, derived: bool = False) -> None:
+    """Bound untrusted representation size before any arithmetic allocation."""
+    parts = value.as_tuple()
+    if (
+        not value.is_finite()
+        or not isinstance(parts.exponent, int)
+        or not -1024 <= parts.exponent <= 1024
+        or len(parts.digits) > (4096 if derived else 1024)
+    ):
+        raise ValueError("unsafe decimal representation")
+    if derived and not isfinite(float(value)):
+        raise ValueError("unsafe Recorder total")
+
+
+def exact_sum(values: Iterable[Decimal]) -> Decimal:
+    """Sum bounded decimals exactly, without ambient rounding or unbounded precision."""
+    items = tuple(values)
+    if not items:
+        return Decimal(0)
+    for item in items:
+        validate_decimal(item, derived=True)
+    precision = max(
+        1,
+        max(item.adjusted() for item in items)
+        - min(int(item.as_tuple().exponent) for item in items)
+        + len(str(len(items)))
+        + 2,
+    )
+    if precision > 4096:
+        raise ValueError("unsafe decimal precision")
+    with localcontext(Context(prec=precision, Emax=MAX_EMAX, Emin=MIN_EMIN)):
+        result = sum(items, Decimal(0))
+    validate_decimal(result, derived=True)
+    return result
 
 
 def _canonical_decimal(value: Decimal) -> str:

@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -74,7 +75,11 @@ jobs:
       - run: .venv-min/bin/python scripts/check_coverage.py coverage-min.json
 
   dependency-audit:
-    name: Dependency audit
+    name: Dependency audit (HA ${{ matrix.homeassistant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        homeassistant: ['2026.9.3', '2026.9.4']
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -90,4 +95,14 @@ jobs:
         with:
           version: '0.12.19'
       - run: uv sync --frozen
-      - run: uv run pip-audit
+      - name: Sync minimum environment
+        if: matrix.homeassistant == '2026.9.3'
+        run: |
+          uv venv --python 3.14 .venv-min
+          uv pip sync --python .venv-min/bin/python requirements/ha-2026.9.3.txt
+      - name: Audit current with expiring upstream exception
+        if: matrix.homeassistant == '2026.9.4'
+        run: uv run python scripts/check_dependency_audit.py 2026.9.4
+      - name: Audit minimum with expiring upstream exception
+        if: matrix.homeassistant == '2026.9.3'
+        run: .venv-min/bin/python scripts/check_dependency_audit.py 2026.9.3

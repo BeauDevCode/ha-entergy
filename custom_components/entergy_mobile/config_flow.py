@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from aiohttp import ClientError
 import voluptuous as vol
@@ -14,7 +15,7 @@ from homeassistant.config_entries import (
     ConfigFlowResult,
     OptionsFlowWithReload,
 )
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.const import CONF_PASSWORD, CONF_TIME_ZONE, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -90,6 +91,7 @@ class EntergyMobileConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._credentials: dict[str, Any] = {}
         self._accounts: tuple[Account, ...] = ()
+        self._selected_account: Account | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         return await self._credentials_step("user", user_input)
@@ -149,20 +151,10 @@ class EntergyMobileConfigFlow(ConfigFlow, domain=DOMAIN):
                 for entry in self._async_current_entries()
             ):
                 return self.async_abort(reason="already_configured")
-            public_id = uuid4().hex
-            statistic_ids(public_id)
-            await self.async_set_unique_id(public_id)
-            return self.async_create_entry(
-                title="Entergy",
-                data={
-                    **self._credentials,
-                    CONF_ACCOUNT_ID: account.account_id,
-                    "public_id": public_id,
-                    "time_zone": account.time_zone or self.hass.config.time_zone,
-                    "ledger_initialized": False,
-                },
-                options={CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS},
-            )
+            self._selected_account = account
+            if account.time_zone is None:
+                return await self.async_step_time_zone()
+            return await self._create_account_entry(account.time_zone)
         return self.async_show_form(
             step_id="account",
             data_schema=vol.Schema(
@@ -174,6 +166,62 @@ class EntergyMobileConfigFlow(ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+        )
+
+    async def async_step_time_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if self._selected_account is None:
+            return await self.async_step_user()
+        errors = {}
+        if user_input is not None:
+            time_zone = user_input.get(CONF_TIME_ZONE, self.hass.config.time_zone)
+            try:
+                ZoneInfo(time_zone)
+            except TypeError, ValueError, ZoneInfoNotFoundError:
+                errors[CONF_TIME_ZONE] = "invalid_time_zone"
+            else:
+                return await self._create_account_entry(time_zone)
+        time_zones = await self.hass.async_add_executor_job(available_timezones)
+        return self.async_show_form(
+            step_id="time_zone",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_TIME_ZONE, default=self.hass.config.time_zone
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=sorted(time_zones),
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                }
+            ),
+            errors=errors,
+        )
+
+    async def _create_account_entry(self, time_zone: str) -> ConfigFlowResult:
+        account = self._selected_account
+        if account is None:
+            return await self.async_step_user()
+        if any(
+            entry.data.get(CONF_ACCOUNT_ID) == account.account_id
+            for entry in self._async_current_entries()
+        ):
+            return self.async_abort(reason="already_configured")
+        public_id = uuid4().hex
+        statistic_ids(public_id)
+        await self.async_set_unique_id(public_id)
+        return self.async_create_entry(
+            title="Entergy",
+            data={
+                **self._credentials,
+                CONF_ACCOUNT_ID: account.account_id,
+                "public_id": public_id,
+                "time_zone": time_zone,
+                "ledger_initialized": False,
+            },
+            options={CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS},
         )
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:

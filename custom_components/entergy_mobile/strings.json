@@ -26,6 +26,13 @@
           "password": "Password",
           "language": "Language"
         }
+      },
+      "time_zone": {
+        "title": "Select service timezone",
+        "description": "Entergy did not provide a timezone for this account. Choose the IANA timezone used for local usage dates and summaries.",
+        "data": {
+          "time_zone": "Service timezone"
+        }
       }
     },
     "error": {
@@ -34,7 +41,8 @@
       "mfa_required": "Entergy requested an additional login step that this integration does not support yet.",
       "no_accounts": "Login worked, but no accounts were returned.",
       "unknown": "Unexpected error.",
-      "unsupported_challenge": "Entergy requires an interactive login step that this integration cannot complete. Keep your account security enabled."
+      "unsupported_challenge": "Entergy requires an interactive login step that this integration cannot complete. Keep your account security enabled.",
+      "invalid_time_zone": "Select a valid IANA timezone."
     },
     "abort": {
       "already_configured": "This account is already configured.",

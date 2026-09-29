@@ -1,6 +1,9 @@
 {
   "domain": "entergy_mobile",
   "name": "Entergy Usage (Unofficial Hardened Fork)",
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
     "@BeauDevCode"
   ],

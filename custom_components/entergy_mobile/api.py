@@ -50,6 +50,15 @@ class RequestBudget:
     limit: int = 12
     used: int = 0
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.limit) is not int
+            or self.limit < 0
+            or type(self.used) is not int
+            or not 0 <= self.used <= min(self.limit, 12)
+        ):
+            raise PolicyError from None
+
     def consume(self) -> None:
         """Reserve one network attempt before touching the session."""
         if self.used >= min(self.limit, 12):
@@ -339,10 +348,9 @@ def _retry_after(value: str | None) -> float | None:
     if value is None:
         return None
     if _DELTA_SECONDS.fullmatch(value):
-        try:
-            return min(max(float(value), 0.0), 86400.0)
-        except ValueError, OverflowError:
-            return None
+        # The ASCII decimal grammar guarantees float conversion; arbitrarily
+        # large magnitudes become infinity and are clamped by the same bounds.
+        return min(max(float(value), 0.0), 86400.0)
     try:
         target = parsedate_to_datetime(value)
         if target.tzinfo is None:

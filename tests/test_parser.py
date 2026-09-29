@@ -187,7 +187,7 @@ def test_foreign_currency_preserves_energy_without_usd_monetary_summary() -> Non
 
 def test_usage_preserves_high_precision_and_tiny_finite_values() -> None:
     precise = "1.0000000000000000000000000001"
-    tiny = "1e-1000000"
+    tiny = "1e-1024"
     with localcontext() as context:
         context.prec = 5
         items = parse(
@@ -253,3 +253,86 @@ def test_usage_quarantine_rejects_unreviewed_hourly_fields(key: str) -> None:
         parse(payload)
     assert "private-canary" not in str(error.value)
     assert key not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"date": 17},
+        {"usage": "not-a-number"},
+        {"isEstimated": "false"},
+        {"currency": "ZZZ"},
+        {"sourceRevision": False},
+    ],
+)
+def test_malformed_hour_fields_fail_closed_without_values(change: dict[str, object]) -> None:
+    hour = record("2026-09-27T10:00:00Z")
+    hour.update(change)
+    with pytest.raises(PayloadError) as error:
+        parse(usage(hour))
+    assert str(error.value) == "payload"
+
+
+def test_source_revision_is_preserved() -> None:
+    assert (
+        parse(usage(record("2026-09-27T10:00:00Z", sourceRevision="reviewed-revision")))[
+            0
+        ].source_revision
+        == "reviewed-revision"
+    )
+
+
+@pytest.mark.parametrize("payload", [{}, {"accounts": {}}, "private-canary"])
+def test_nonlist_accounts_fail_closed(payload: object) -> None:
+    with pytest.raises(PayloadError):
+        parse_accounts(payload)
+
+
+def test_unknown_timezone_and_nonlist_hours_fail_closed() -> None:
+    with pytest.raises(PayloadError):
+        parse_usage(usage(), source_time_zone="invalid/zone", received_at=RECEIVED)
+    with pytest.raises(PayloadError):
+        parse({"data": {"daily": {"electric": [{"hourly": {}}]}}})
+
+
+def test_nested_nonchallenge_lists_allow_valid_login() -> None:
+    assert (
+        parse_login({"token": "valid", "steps": [[{"nextAction": None}, 1, []]]}).access_token
+        == "valid"
+    )
+
+
+@pytest.mark.parametrize("field", ["usage", "cost"])
+@pytest.mark.parametrize("value", ["1e-1025", "0e1025", "1." + "0" * 1024])
+def test_decimal_representation_limits_reject_small_hostile_payloads(
+    field: str, value: str
+) -> None:
+    item = record("2026-09-27T10:00:00Z")
+    item[field] = value
+    with pytest.raises(PayloadError) as error:
+        parse(usage(item))
+    assert str(error.value) == "payload"
+
+
+def test_summary_sums_and_compensation_ignore_ambient_decimal_context() -> None:
+    exact = "1.12345678901234567890123456789"
+    items = parse(
+        usage(
+            record("2026-09-27T10:00:00Z", exact, cost="-" + exact),
+            record("2026-09-27T11:00:00Z", "-" + exact, cost=exact),
+        )
+    )
+    with localcontext() as context:
+        context.prec = 5
+        snapshot = summarize_usage(LedgerState(intervals=items), time_zone="UTC", now=RECEIVED)
+    assert snapshot.month_import_kwh == Decimal(exact)
+    assert snapshot.month_return_kwh == Decimal(exact)
+    assert snapshot.month_cost == Decimal(exact)
+    assert snapshot.month_compensation == Decimal(exact)
+
+
+@pytest.mark.parametrize("value", ["0." + "1" * 1024, "1e-1024", "0e1024"])
+def test_source_decimal_representation_boundary_remains_exact(value: str) -> None:
+    parsed = parse(usage(record("2026-09-27T10:00:00Z", value, cost=value)))[0]
+    assert parsed.import_kwh == Decimal(value)
+    assert parsed.amount == Decimal(value)

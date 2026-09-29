@@ -1,7 +1,7 @@
 """Correction-safe external statistics, including persisted crash recovery."""
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
@@ -407,3 +407,74 @@ def test_pruned_non_usd_amounts_never_reappear_as_usd_statistics(
     assert batches[IDS.return_] == ({"start": recent, "state": 1.0, "sum": 3.0},)
     assert batches[IDS.cost] == ({"start": recent, "state": 1.0, "sum": cost},)
     assert batches[IDS.compensation] == ({"start": recent, "state": 0.0, "sum": compensation},)
+
+
+@pytest.mark.parametrize("public_id", ["has space", "has/slash", "has:colon"])
+def test_invalid_public_id_cannot_create_recorder_identity(public_id: str) -> None:
+    with pytest.raises(ValueError, match="invalid public statistics identity"):
+        statistic_ids(public_id)
+
+
+async def test_empty_expected_statistics_cannot_verify_pending_work(hass: HomeAssistant) -> None:
+    assert not await async_verify_queued_statistics(
+        hass, ids=IDS, expected_batches=(), through=HOUR
+    )
+
+
+@pytest.mark.parametrize(
+    "through",
+    [
+        HOUR.replace(tzinfo=None),
+        HOUR + timedelta(minutes=1),
+        HOUR.astimezone(timezone(timedelta(hours=1))),
+    ],
+)
+async def test_invalid_verification_boundary_never_confirms_commit(
+    hass: HomeAssistant, through: datetime
+) -> None:
+    assert not await async_verify_queued_statistics(
+        hass, ids=IDS, expected_batches=build(LedgerState(intervals=(interval(),))), through=through
+    )
+
+
+async def test_offsetting_corrections_must_verify_entire_pending_suffix(
+    recorder_mock: Recorder, hass: HomeAssistant
+) -> None:
+    """A matching last hour cannot prove that earlier corrections survived a crash."""
+    third = NEXT + timedelta(hours=1)
+    original = build(
+        LedgerState(
+            intervals=(
+                interval(energy="10"),
+                interval(NEXT, energy="20"),
+                interval(third, energy="30"),
+            )
+        )
+    )
+    corrected = build(
+        LedgerState(
+            intervals=(
+                interval(energy="11"),
+                interval(NEXT, energy="19"),
+                interval(third, energy="30"),
+            )
+        )
+    )
+    await async_queue_external_statistics(hass, original)
+    await async_wait_recording_done(hass)
+    assert original[0][1][-1] == corrected[0][1][-1]
+    assert statistics_fingerprint(original) != statistics_fingerprint(corrected)
+    assert not await async_verify_queued_statistics(
+        hass, ids=IDS, expected_batches=corrected, through=third
+    )
+    await async_queue_external_statistics(hass, corrected)
+    await async_wait_recording_done(hass)
+    assert await async_verify_queued_statistics(
+        hass, ids=IDS, expected_batches=corrected, through=third
+    )
+    actual = await rows_in_recorder(hass)
+    assert [(row["state"], row["sum"]) for row in actual[IDS.consumption]] == [
+        (11, 11),
+        (19, 30),
+        (30, 60),
+    ]

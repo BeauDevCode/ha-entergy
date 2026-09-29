@@ -198,7 +198,7 @@ def test_public_documents_disclose_operational_limits() -> None:
         "SECURITY.md": (
             "@BeauDevCode",
             "private vulnerability reporting",
-            "not enabled",
+            "security/advisories/new",
             "credentials",
         ),
         "CONTRIBUTING.md": ("Python 3.14", "0.12.19", "synthetic", "mypy", "pip-audit"),
@@ -424,3 +424,21 @@ def test_coverage_checker_policy(tmp_path: Path, mutation: str) -> None:
         text=True,
     )
     assert (result.returncode == 0) is (mutation == "valid"), result.stderr
+
+
+def test_recorder_import_is_declared_for_hassfest() -> None:
+    """Recorder must initialize first when enabled, without forcing it on users."""
+    manifest = json.loads(MANIFEST.read_text())
+    assert "recorder" in manifest.get("after_dependencies", [])
+    assert manifest["requirements"] == []
+
+
+def test_feature_commits_have_one_required_check_context() -> None:
+    import yaml
+
+    for name in ("ci", "validate", "codeql"):
+        workflow = yaml.safe_load((ROOT / f".github/workflows/{name}.yml").read_text())
+        # YAML 1.1 parses the Actions `on` key as True.
+        events = workflow.get("on", workflow.get(True))
+        assert events["push"] == {"branches": ["main"]}
+        assert "pull_request" in events

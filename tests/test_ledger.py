@@ -902,3 +902,176 @@ def test_retention_baselines_include_only_usd_or_omitted_source_currency(
         Decimal(cost),
         Decimal(compensation),
     )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("revision", -1),
+        ("revision", True),
+        ("statistics_pending_fingerprint", 1),
+        ("backfill_cursor", 42),
+    ],
+)
+async def test_rehashed_malformed_store_fields_block_import(
+    hass: HomeAssistant, hass_storage: dict[str, Any], field: str, value: object
+) -> None:
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+    raw = hass_storage[KEY]["data"]
+    raw[field] = value
+    raw.pop("fingerprint")
+    raw["fingerprint"] = api._fingerprint(raw)
+    restarted = EntergyLedger(hass, PUBLIC_ID)
+    with pytest.raises(LedgerRepairError):
+        await restarted.async_load(initialized=True)
+    assert restarted.state.revision == 0
+
+
+@pytest.mark.parametrize("change", ["interval_fingerprint", "noncanonical_timestamp"])
+async def test_rehashed_store_still_rejects_invalid_canonical_intervals(
+    hass: HomeAssistant, hass_storage: dict[str, Any], change: str
+) -> None:
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+    raw = hass_storage[KEY]["data"]
+    if change == "interval_fingerprint":
+        raw["intervals"][HOUR.isoformat()]["fingerprint"] = "a" * 64
+    else:
+        raw["intervals"][HOUR.isoformat().replace("+00:00", "Z")] = raw["intervals"].pop(
+            HOUR.isoformat()
+        )
+    raw.pop("fingerprint")
+    raw["fingerprint"] = api._fingerprint(raw)
+    with pytest.raises(LedgerRepairError):
+        await EntergyLedger(hass, PUBLIC_ID).async_load(initialized=True)
+
+
+@pytest.mark.parametrize("state", [CoreState.stopping, CoreState.final_write])
+async def test_shutdown_during_initial_load_never_promotes_state(
+    hass: HomeAssistant, state: CoreState
+) -> None:
+    ledger = EntergyLedger(hass, PUBLIC_ID)
+    hass.set_state(state)
+    try:
+        with pytest.raises(LedgerRepairError):
+            await ledger.async_load(initialized=False)
+        assert ledger.state.revision == 0
+        assert (await ledger.async_ingest(mutation(ledger))).deferred
+    finally:
+        hass.set_state(CoreState.running)
+
+
+@pytest.mark.parametrize("state", [CoreState.stopping, CoreState.final_write])
+async def test_shutdown_write_exception_is_retryable_without_promotion(
+    hass: HomeAssistant, state: CoreState
+) -> None:
+    ledger = await loaded(hass)
+    before = ledger.state
+
+    async def fail_save(*args: object) -> None:
+        hass.set_state(state)
+        raise OSError("private-canary")
+
+    try:
+        with patch.object(Store, "async_save", fail_save):
+            result = await ledger.async_ingest(mutation(ledger))
+        assert result.deferred and result.repair is None
+        assert result.state is before and ledger.state is before
+        assert result.earliest_statistics_hour is None
+    finally:
+        hass.set_state(CoreState.running)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+
+
+def test_exact_sum_empty_identity() -> None:
+    assert api._exact_sum(iter(())) == Decimal(0)
+
+
+@pytest.mark.parametrize("value", ["1e-1025", "0e1025", "1." + "0" * 1024])
+async def test_persisted_interval_representation_limit_blocks_load(
+    hass: HomeAssistant, hass_storage: dict[str, Any], value: str
+) -> None:
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+    raw = hass_storage[KEY]["data"]
+    raw["intervals"][HOUR.isoformat()]["import_kwh"] = str(Decimal(value))
+    raw["intervals"][HOUR.isoformat()]["fingerprint"] = replace(
+        interval(), import_kwh=Decimal(value)
+    ).fingerprint
+    raw.pop("fingerprint")
+    raw["fingerprint"] = api._fingerprint(raw)
+    with pytest.raises(LedgerRepairError):
+        await EntergyLedger(hass, PUBLIC_ID).async_load(initialized=True)
+
+
+@pytest.mark.parametrize("value", ["1e-1025", "0e1025", "1." + "0" * 1024])
+async def test_legacy_decimal_representation_limit_blocks_before_arithmetic(
+    hass: HomeAssistant, hass_storage: dict[str, Any], value: str
+) -> None:
+    data = legacy_data()
+    data["intervals"]["2026-09-01T10:00:00Z"]["cost"] = value
+    hass_storage[LEGACY_KEY] = {"version": 1, "data": data}
+    with pytest.raises(LedgerRepairError):
+        await async_import_legacy_v1_store(hass, entry_id="test-entry", public_id=PUBLIC_ID)
+
+
+async def test_valid_tiny_intervals_prune_to_larger_exact_baseline(hass: HomeAssistant) -> None:
+    first = replace(interval(), import_kwh=Decimal(1), amount=None)
+    second = replace(
+        first,
+        start=HOUR + timedelta(hours=1),
+        end=HOUR + timedelta(hours=2),
+        import_kwh=Decimal("1e-1024"),
+    )
+    state = LedgerState(schema_version=2, intervals=(first, second))
+    pruned = api.reconcile(state, (), received_at=HOUR + timedelta(days=401))
+    expected = Decimal("1." + "0" * 1023 + "1")
+    assert pruned.state.baseline.import_kwh == expected
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(pruned)).deferred
+    assert (
+        await EntergyLedger(hass, PUBLIC_ID).async_load(initialized=True)
+    ).baseline.import_kwh == expected
+
+
+async def test_derived_baseline_above_fixed_resource_ceiling_is_rejected(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+    raw = hass_storage[KEY]["data"]
+    raw["baseline"]["import_kwh"] = "1" * 4097
+    raw.pop("fingerprint")
+    raw["fingerprint"] = api._fingerprint(raw)
+    with pytest.raises(LedgerRepairError):
+        await EntergyLedger(hass, PUBLIC_ID).async_load(initialized=True)
+
+
+@pytest.mark.parametrize(
+    "values", [(Decimal("1e-1000000000"),), (Decimal("1" * 4096), Decimal("1e-1024"))]
+)
+def test_exact_sum_rejects_resource_expansion_before_context_allocation(
+    values: tuple[Decimal, ...],
+) -> None:
+    with (
+        patch(
+            "custom_components.entergy_mobile.models.Context",
+            side_effect=AssertionError("must not allocate"),
+        ),
+        pytest.raises(ValueError, match="unsafe"),
+    ):
+        api._exact_sum(values)
+
+
+async def test_nonfinite_recorder_baseline_blocks_at_store_boundary(
+    hass: HomeAssistant, hass_storage: dict[str, Any]
+) -> None:
+    ledger = await loaded(hass)
+    assert not (await ledger.async_ingest(mutation(ledger))).deferred
+    raw = hass_storage[KEY]["data"]
+    raw["baseline"]["import_kwh"] = "1E+309"
+    raw.pop("fingerprint")
+    raw["fingerprint"] = api._fingerprint(raw)
+    with pytest.raises(LedgerRepairError):
+        await EntergyLedger(hass, PUBLIC_ID).async_load(initialized=True)

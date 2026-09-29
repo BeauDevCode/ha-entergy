@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 import logging
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
@@ -36,7 +36,7 @@ from .errors import (
     RateLimitError,
 )
 from .ledger import EntergyLedger, LedgerRepairError, reconcile
-from .models import EnergyInterval, LedgerMutation, LedgerState, UsageSnapshot
+from .models import Account, EnergyInterval, LedgerMutation, LedgerState, UsageSnapshot
 from .parser import summarize_usage
 from .statistics import (
     StatisticsBatch,
@@ -297,7 +297,11 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
             fingerprint = statistics_fingerprint(batches)
             if (
                 state.statistics_pending_fingerprint is not None
-                and state.statistics_pending_fingerprint != fingerprint
+                and state.statistics_pending_fingerprint
+                not in (
+                    fingerprint,
+                    self._alternate_pending_fingerprint(state, state.statistics_pending_from),
+                )
             ):
                 raise LedgerRepairError from None
         self.data = self._snapshot(state)
@@ -351,6 +355,24 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
             start=start,
         )
 
+    def _alternate_pending_fingerprint(self, state: LedgerState, start: datetime) -> str:
+        """Accept only the other reviewed USD/energy-only payload for this suffix."""
+        alternate_currency = "EUR" if self.hass.config.currency == "USD" else "USD"
+        alternate = build_hourly_statistics(
+            state, public_id=self._public_id, currency=alternate_currency, start=start
+        )
+        return statistics_fingerprint(alternate)
+
+    def _use_confirmed_account_zone(self, account: Account) -> None:
+        if account.time_zone is None or account.time_zone == self._time_zone:
+            return
+        try:
+            zone = ZoneInfo(account.time_zone)
+        except ValueError, ZoneInfoNotFoundError:
+            return
+        self._time_zone = account.time_zone
+        self._zone = zone
+
     async def _async_recover_pending_statistics(self) -> None:
         state = self._ledger.state
         pending = state.statistics_pending_from
@@ -363,7 +385,12 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
             self._condition = "ledger_repair"
             self._repair_conditions.add("ledger_repair")
             raise UpdateFailed("ledger") from None
-        if state.statistics_pending_fingerprint is None:
+        if (
+            state.statistics_pending_fingerprint is None
+            or state.statistics_pending_fingerprint != fingerprint
+            and state.statistics_pending_fingerprint
+            == self._alternate_pending_fingerprint(state, pending)
+        ):
             mutation = await self._ledger.async_mark_statistics_pending(
                 from_hour=pending, fingerprint=fingerprint
             )
@@ -458,10 +485,11 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
     async def _async_normal_chain(self) -> UsageSnapshot:
         await self._async_recover_pending_statistics()
         now = _utc_now(self._clock)
+        budget = RequestBudget()
+        account = await self._client.async_get_account(self._account_id, budget)
+        self._use_confirmed_account_zone(account)
         today = now.astimezone(self._zone).date()
         floor = today - timedelta(days=_NORMAL_DAYS - 1)
-        budget = RequestBudget()
-        await self._client.async_get_account(self._account_id, budget)
         pages: list[EnergyInterval] = []
         for start in self._normal_starts(today):
             page = await self._client.async_get_weekly_usage(
@@ -641,9 +669,10 @@ class EntergyDataUpdateCoordinator(DataUpdateCoordinator[UsageSnapshot]):
                     return False
                 await self._async_recover_pending_statistics()
                 now = _utc_now(self._clock)
-                start, floor, complete = self._next_backfill_page(now)
                 budget = RequestBudget()
-                await self._client.async_get_account(self._account_id, budget)
+                account = await self._client.async_get_account(self._account_id, budget)
+                self._use_confirmed_account_zone(account)
+                start, floor, complete = self._next_backfill_page(now)
                 incoming = await self._client.async_get_weekly_usage(
                     self._account_id,
                     start,

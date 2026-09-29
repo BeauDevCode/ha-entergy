@@ -92,6 +92,7 @@ class FakeLedger:
         self.pending_calls: list[tuple[datetime, str]] = []
         self.verified_calls: list[tuple[datetime, str]] = []
         self.fail_ingest = False
+        self.fail_pending = False
 
     @property
     def state(self) -> LedgerState:
@@ -114,6 +115,8 @@ class FakeLedger:
         self, *, from_hour: datetime, fingerprint: str
     ) -> LedgerMutation:
         self.pending_calls.append((from_hour, fingerprint))
+        if self.fail_pending:
+            return LedgerMutation(self._state, deferred=True, repair="ledger_repair")
         self._state = replace(
             self._state,
             revision=self._state.revision + 1,
@@ -152,7 +155,9 @@ class FakeClient:
         self.failures = list(failures or [])
         self.consume_cold = consume_cold
         self.recovery_attempts = recovery_attempts
+        self.account_time_zone: str | None = None
         self.calls: list[tuple[str, object, object]] = []
+        self.fallback_zones: list[str] = []
         self.active = 0
         self.max_active = 0
         self.block: asyncio.Event | None = None
@@ -166,7 +171,7 @@ class FakeClient:
             self.consume_cold = False
         else:
             budget.consume()
-        return Account(account_id, time_zone=None)
+        return Account(account_id, time_zone=self.account_time_zone)
 
     async def async_get_weekly_usage(
         self,
@@ -177,6 +182,7 @@ class FakeClient:
         fallback_time_zone: str,
     ) -> tuple[EnergyInterval, ...]:
         self.calls.append(("page", start_date, budget))
+        self.fallback_zones.append(fallback_time_zone)
         budget.consume()
         if self.recovery_attempts:
             for _ in range(self.recovery_attempts):
@@ -315,6 +321,43 @@ async def test_normal_sync_fetches_seven_pages_in_one_shared_budget_and_one_inge
     assert next(iter({call[2].used for call in client.calls})) == 10
     assert len(ledger.ingests) == 1
     assert result.latest_import_kwh == 1
+
+
+async def test_confirmed_account_zone_controls_same_chain_dates_and_later_fallback(
+    hass: HomeAssistant, recorder_stubs: list[str]
+) -> None:
+    client = FakeClient()
+    client.account_time_zone = "America/Los_Angeles"
+    config_entry = entry(hass)
+    subject = coordinator(
+        hass,
+        client,
+        FakeLedger(),
+        clock=FakeClock(datetime(2026, 9, 28, 5, 30, tzinfo=UTC)),
+        config_entry=config_entry,
+    )
+    await subject.async_initialize()
+    await subject._async_update_data()
+    assert [call[1] for call in client.calls if call[0] == "page"][-1] == date(2026, 9, 25)
+    assert client.fallback_zones == ["America/Los_Angeles"] * 7
+    assert config_entry.data["time_zone"] == "America/Chicago"
+    client.account_time_zone = None
+    await subject._async_update_data()
+    assert client.fallback_zones == ["America/Los_Angeles"] * 14
+
+
+async def test_confirmed_account_zone_controls_first_backfill_page(
+    hass: HomeAssistant, recorder_stubs: list[str]
+) -> None:
+    client = FakeClient()
+    client.account_time_zone = "America/Los_Angeles"
+    subject = coordinator(
+        hass, client, FakeLedger(), clock=FakeClock(datetime(2026, 9, 28, 5, 30, tzinfo=UTC))
+    )
+    await subject.async_initialize()
+    assert await subject.async_run_backfill_once()
+    assert [call[1] for call in client.calls if call[0] == "page"] == [date(2026, 9, 21)]
+    assert client.fallback_zones == ["America/Los_Angeles"]
 
 
 async def test_normal_chain_leaves_exact_budget_for_one_auth_recovery(
@@ -489,6 +532,81 @@ async def test_exact_pending_verification_clears_without_requeue(
     await subject._async_update_data()
     assert ledger.verified_calls
     assert not queued
+
+
+@pytest.mark.parametrize(
+    ("stored_currency", "home_currency", "expected_series"),
+    [("USD", "EUR", 2), ("EUR", "USD", 4)],
+)
+async def test_currency_mode_switch_persists_new_pending_before_requeue(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    stored_currency: str,
+    home_currency: str,
+    expected_series: int,
+) -> None:
+    record = interval()
+    base = LedgerState(schema_version=2, intervals=(record,))
+    stored = module.statistics_fingerprint(
+        module.build_hourly_statistics(
+            base, public_id=PUBLIC_ID, currency=stored_currency, start=record.start
+        )
+    )
+    ledger = FakeLedger(
+        replace(base, statistics_pending_from=record.start, statistics_pending_fingerprint=stored)
+    )
+    client = FakeClient()
+    subject = coordinator(hass, client, ledger)
+    hass.config.currency = home_currency
+    await subject.async_initialize()
+    seen: list[tuple[str | None, int]] = []
+
+    async def queue(_: HomeAssistant, batches: Any) -> object:
+        seen.append((ledger.state.statistics_pending_fingerprint, len(batches)))
+        return object()
+
+    monkeypatch.setattr(module, "async_verify_queued_statistics", _false)
+    monkeypatch.setattr(module, "async_queue_external_statistics", queue)
+    await subject._async_update_data()
+    assert seen and seen[0][1] == expected_series
+    assert ledger.pending_calls == [(record.start, seen[0][0])]
+    assert seen[0][0] != stored
+    assert ledger.state.statistics_pending_from == record.start
+    assert subject.diagnostics()["repair_conditions"] == (
+        ["currency_mismatch"] if home_currency == "EUR" else []
+    )
+
+
+async def test_currency_mode_migration_deferral_queues_nothing(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = interval()
+    base = LedgerState(schema_version=2, intervals=(record,))
+    old = module.statistics_fingerprint(
+        module.build_hourly_statistics(
+            base, public_id=PUBLIC_ID, currency="USD", start=record.start
+        )
+    )
+    ledger = FakeLedger(
+        replace(base, statistics_pending_from=record.start, statistics_pending_fingerprint=old)
+    )
+    ledger.fail_pending = True
+    client = FakeClient()
+    subject = coordinator(hass, client, ledger)
+    hass.config.currency = "EUR"
+    await subject.async_initialize()
+    queued = False
+
+    async def queue(*_: Any, **__: Any) -> object:
+        nonlocal queued
+        queued = True
+        return object()
+
+    monkeypatch.setattr(module, "async_queue_external_statistics", queue)
+    with pytest.raises(UpdateFailed, match="ledger"):
+        await subject._async_update_data()
+    assert ledger.state.statistics_pending_fingerprint == old
+    assert not queued and client.calls == []
 
 
 async def _true(*_: Any, **__: Any) -> bool:

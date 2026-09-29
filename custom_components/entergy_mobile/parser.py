@@ -16,6 +16,8 @@ from .models import (
     LedgerState,
     LoginResult,
     UsageSnapshot,
+    exact_sum,
+    validate_decimal,
 )
 
 _ACCOUNT_ALIASES = ("accountId", "accountID", "account_id", "accountNumber", "account_number")
@@ -219,6 +221,10 @@ def _decimal(value: object) -> Decimal:
         raise PayloadError from None
     if not result.is_finite():
         raise PayloadError
+    try:
+        validate_decimal(result)
+    except ValueError:
+        raise PayloadError from None
     return Decimal(0) if result.is_zero() else result
 
 
@@ -406,17 +412,17 @@ def summarize_usage(state: LedgerState, *, time_zone: str, now: datetime) -> Usa
         if not items:
             return None
         if kind == "import":
-            return sum((item.import_kwh for item in items), Decimal(0))
+            return exact_sum(item.import_kwh for item in items)
         if kind == "return":
-            return sum((item.return_kwh for item in items), Decimal(0))
+            return exact_sum(item.return_kwh for item in items)
         if not monetary_allowed:
             return None
         amounts = [item.amount for item in items if item.amount is not None]
         if not amounts:
             return None
         if kind == "cost":
-            return sum((max(amount, Decimal(0)) for amount in amounts), Decimal(0))
-        return sum((max(-amount, Decimal(0)) for amount in amounts), Decimal(0))
+            return exact_sum(max(amount, Decimal(0)) for amount in amounts)
+        return exact_sum(max(amount.copy_negate(), Decimal(0)) for amount in amounts)
 
     latest = [newest] if newest is not None else []
     return UsageSnapshot(

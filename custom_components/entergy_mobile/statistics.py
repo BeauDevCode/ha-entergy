@@ -188,7 +188,7 @@ async def async_verify_queued_statistics(
     expected_batches: Sequence[StatisticsBatch],
     through: datetime,
 ) -> bool:
-    """Check both values of every nonempty series at the persisted boundary.
+    """Check every pending row through the persisted boundary for each series.
 
     Query in Recorder's executor without flushing its queue or implying that a
     queue return was durable. Missing boundaries or mismatched identities keep
@@ -201,7 +201,7 @@ async def async_verify_queued_statistics(
     ):
         return False
     allowed = {ids.consumption, ids.return_, ids.cost, ids.compensation}
-    expected: dict[str, StatisticData] = {}
+    expected: dict[str, list[StatisticData]] = {}
     for meta, rows in expected_batches:
         if not rows:
             continue
@@ -209,13 +209,13 @@ async def async_verify_queued_statistics(
         boundary = [row for row in rows if row["start"] == through]
         if statistic_id not in allowed or statistic_id in expected or len(boundary) != 1:
             return False
-        expected[statistic_id] = boundary[0]
+        expected[statistic_id] = [row for row in rows if row["start"] <= through]
     if not expected:
         return False
     recorded = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
-        through,
+        min(row["start"] for rows in expected.values() for row in rows),
         through + timedelta(hours=1),
         set(expected),
         "hour",
@@ -223,9 +223,19 @@ async def async_verify_queued_statistics(
         {"state", "sum"},
     )
     for statistic_id, wanted in expected.items():
-        matches = [
-            row for row in recorded.get(statistic_id, ()) if row["start"] == through.timestamp()
-        ]
-        if len(matches) != 1 or any(matches[0].get(key) != wanted[key] for key in ("state", "sum")):
+        actual = recorded.get(statistic_id, ())
+        expected_by_start = {row["start"].timestamp(): row for row in wanted}
+        actual_by_start = {row["start"]: row for row in actual}
+        if (
+            len(expected_by_start) != len(wanted)
+            or len(actual_by_start) != len(actual)
+            or expected_by_start.keys() != actual_by_start.keys()
+        ):
+            return False
+        if any(
+            actual_by_start[start].get(key) != row[key]
+            for start, row in expected_by_start.items()
+            for key in ("state", "sum")
+        ):
             return False
     return True

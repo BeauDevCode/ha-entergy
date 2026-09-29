@@ -736,3 +736,131 @@ async def test_budget_counts_initialization_login_and_failed_auth_recovery() -> 
         "/api/login",
         "/api/accounts",
     ]
+
+
+@pytest.mark.parametrize(
+    "options", [{"language": ""}, {"language": None}, {"app_version": ""}, {"app_version": 1}]
+)
+def test_invalid_client_options_fail_before_network(options: dict[str, Any]) -> None:
+    session = FakeSession()
+    with pytest.raises(PolicyError):
+        api.EntergyApiClient(session, Credentials("user", "password"), **options)
+    assert not session.calls
+
+
+async def test_uninitialized_logout_request_fails_before_network() -> None:
+    session = FakeSession()
+    subject = client(session)
+    assert subject.client_id is None
+    with pytest.raises(PolicyError):
+        await subject._request_json(api.ApiOperation.LOGOUT, api.RequestBudget())
+    assert not session.calls
+
+
+@pytest.mark.parametrize("field", ["_client_id", "_access_token"])
+async def test_header_control_characters_never_reach_session(field: str) -> None:
+    session = FakeSession()
+    subject = authenticated(session)
+    setattr(subject, field, "private\r\nInjected: value")
+    with pytest.raises(PayloadError) as error:
+        await subject.async_get_accounts(api.RequestBudget())
+    assert "private" not in str(error.value)
+    assert not session.calls
+
+
+@pytest.mark.parametrize("kwargs", [{"account_id": "valid"}, {"start_date": date(2026, 9, 1)}])
+async def test_operation_rejects_unreviewed_arguments(kwargs: dict[str, Any]) -> None:
+    session = FakeSession()
+    with pytest.raises(PolicyError):
+        await client(session)._request_json(api.ApiOperation.APP, api.RequestBudget(), **kwargs)
+    assert not session.calls
+
+
+async def test_usage_rejects_datetime_start_date_before_network() -> None:
+    session = FakeSession()
+    with pytest.raises(PolicyError):
+        await authenticated(session).async_get_weekly_usage(
+            "valid", datetime.now(UTC), api.RequestBudget()
+        )
+    assert not session.calls
+
+
+async def test_server_error_is_transient_and_value_free() -> None:
+    subject = authenticated(FakeSession(FakeResponse({"private": "canary"}, status=503)))
+    with pytest.raises(EntergyError) as error:
+        await subject.async_get_accounts(api.RequestBudget())
+    assert error.value.category is ErrorCategory.TRANSIENT
+    assert error.value.status == 503
+    assert "canary" not in str(error.value)
+
+
+async def test_confirmed_account_timezone_overrides_usage_fallback() -> None:
+    session = FakeSession(
+        FakeResponse({"data": {"accountId": "valid", "timeZone": "Europe/London"}}),
+        FakeResponse(usage(1)),
+    )
+    subject = authenticated(session)
+    account = await subject.async_get_account("valid", api.RequestBudget())
+    assert account.time_zone == "Europe/London"
+    # An invalid fallback is harmless only if the confirmed service zone is used.
+    intervals = await subject.async_get_weekly_usage(
+        "valid", date(2026, 9, 1), api.RequestBudget(), fallback_time_zone="invalid/zone"
+    )
+    assert len(intervals) == 1
+
+
+async def test_transport_caps_normalized_intervals_if_parser_contract_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from custom_components.entergy_mobile.parser import parse_usage
+
+    first = parse_usage(usage(512), source_time_zone="UTC", received_at=datetime.now(UTC))
+    from dataclasses import replace
+
+    extra = replace(first[-1], start=first[-1].end, end=first[-1].end + timedelta(hours=1))
+    monkeypatch.setattr(api, "parse_usage", lambda *args, **kwargs: (*first, extra))
+    subject = authenticated(FakeSession(FakeResponse(usage(1))))
+    with pytest.raises(PayloadError):
+        await subject.async_get_weekly_usage("valid", date(2026, 9, 1), api.RequestBudget())
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ("Wed, 21 Oct 2015 07:28:00", None),
+        ("9" * 1000, 86400.0),
+        ("-" + "9" * 1000, 0.0),
+        ("invalid", None),
+    ],
+)
+def test_retry_after_missing_naive_invalid_and_extreme_values(
+    value: str | None, expected: float | None
+) -> None:
+    assert api._retry_after(value) == expected
+
+
+def test_ledger_error_has_only_safe_category() -> None:
+    from custom_components.entergy_mobile.errors import LedgerError
+
+    error = LedgerError()
+    assert error.category is ErrorCategory.LEDGER
+    assert str(error) == "ledger"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"used": -1},
+        {"used": True},
+        {"used": 1.5},
+        {"used": 13},
+        {"limit": -1},
+        {"limit": False},
+        {"limit": 1.5},
+        {"limit": 2, "used": 3},
+    ],
+)
+def test_budget_rejects_invalid_initial_state(options: dict[str, Any]) -> None:
+    with pytest.raises(PolicyError):
+        api.RequestBudget(**options)
