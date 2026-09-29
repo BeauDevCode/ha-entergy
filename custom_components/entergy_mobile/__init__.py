@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os.path
 import re
 from dataclasses import replace
 from uuid import uuid4
@@ -44,6 +45,8 @@ def get_coordinator(hass: HomeAssistant, entry: ConfigEntry) -> EntergyDataUpdat
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Entergy from a config entry."""
+    if not await async_recover_migration(hass, entry):
+        raise ConfigEntryNotReady("ledger_repair")
     hass.data.setdefault(DOMAIN, {})
 
     session = async_get_clientsession(hass)
@@ -101,12 +104,15 @@ def _migration_issue(hass: HomeAssistant, public_id: str, key: str) -> None:
         DOMAIN,
         f"{key}_{public_id}",
         is_fixable=False,
+        is_persistent=True,
         severity=ir.IssueSeverity.WARNING,
         translation_key=key,
     )
 
 
-def _migrate_registries(hass: HomeAssistant, entry: ConfigEntry, public_id: str) -> None:
+def _migrate_registries(
+    hass: HomeAssistant, entry: ConfigEntry, public_id: str, *, recovery: bool = False
+) -> None:
     """Use stable registry UUIDs for resumable, privacy-first updates."""
     devices, entities = dr.async_get(hass), er.async_get(hass)
     tokens = {str(entry.data.get(key, "")).casefold() for key in (CONF_USERNAME, CONF_ACCOUNT_ID)}
@@ -141,7 +147,11 @@ def _migrate_registries(hass: HomeAssistant, entry: ConfigEntry, public_id: str)
     prefix = f"{DOMAIN}_{entry.entry_id}_{entry.data.get(CONF_ACCOUNT_ID, '')}_"
     for entity in attached:
         changes: dict[str, object] = {}
-        if rename_all:
+        if rename_all and (
+            not recovery
+            or not entity.unique_id.startswith(f"{public_id}_")
+            or unsafe(entity.entity_id)
+        ):
             target = f"{entity.domain}.entergy_{public_id}_{entity.id}"
             if entity.entity_id != target:
                 changes["new_entity_id"] = entities.async_get_available_entity_id(
@@ -169,18 +179,53 @@ def _migrate_registries(hass: HomeAssistant, entry: ConfigEntry, public_id: str)
                 "tracked_interval_count",
                 "latest_hour_timestamp",
             }
+            intermediate_prefix = f"entergy_migration_{public_id}_"
             key = entity.unique_id.removeprefix(prefix)
+            if entity.unique_id.startswith(intermediate_prefix):
+                key = entity.unique_id.removeprefix(intermediate_prefix)
             if entity.unique_id.startswith(f"{public_id}_"):
                 key = entity.unique_id.removeprefix(f"{public_id}_")
-            if key not in known:
-                key = f"legacy_{entity.id}"
-            if entity.unique_id != f"{public_id}_{key}":
-                changes["new_unique_id"] = f"{public_id}_{key}"
+            already_public = entity.unique_id.startswith(f"{public_id}_")
+            previous_private = entity.previous_unique_id is not None and unsafe(
+                entity.previous_unique_id
+            )
+            # A startup guard must not rewrite future runtime sensor identities.
+            migrate_identity = not recovery or not already_public or previous_private
+            if migrate_identity:
+                if key not in known:
+                    key = f"legacy_{entity.id}"
+                final_id = f"{public_id}_{key}"
+                intermediate_id = f"{intermediate_prefix}{key}"
+                if entity.unique_id != final_id or previous_private:
+                    conflict = entities.async_get_entity_id(
+                        entity.domain, entity.platform, final_id
+                    )
+                    if conflict is not None and conflict != entity.entity_id:
+                        raise LedgerRepairError
+                    # HA preserves current unique_id as previous_unique_id. Use
+                    # two public transitions so both retained values are pseudonymous.
+                    if entity.unique_id != intermediate_id:
+                        entity = entities.async_update_entity(
+                            entity.entity_id, new_unique_id=intermediate_id
+                        )
+                    changes["new_unique_id"] = final_id
             if key in {"total_import_kwh", "total_export_kwh"}:
                 changes["disabled_by"] = er.RegistryEntryDisabler.INTEGRATION
-            changes.update(name=None, original_name="Entergy", aliases=set())
+            if migrate_identity:
+                changes.update(name=None, original_name="Entergy", aliases=[])
+                # The public get-or-create API also updates existing entries;
+                # remove cached legacy naming inputs from serialized registry data.
+                entity = entities.async_get_or_create(
+                    entity.domain,
+                    entity.platform,
+                    entity.unique_id,
+                    config_entry=entry,
+                    suggested_object_id=None,
+                    object_id_base=None,
+                    supported_features=entity.supported_features,
+                )
         elif rename_all:
-            changes.update(name=None, aliases=set())
+            changes.update(name=None, aliases=[])
         changes = {
             key: value
             for key, value in changes.items()
@@ -199,7 +244,29 @@ def _migrate_registries(hass: HomeAssistant, entry: ConfigEntry, public_id: str)
     _migration_issue(hass, public_id, "legacy_energy_source")
 
 
-async def _migration_identity(hass: HomeAssistant, entry: ConfigEntry) -> str:
+def _checkpoint_or_corrupt_artifact_exists(path: str) -> bool:
+    """Check only owned checkpoint names, including retained/broken symlinks.
+
+    Store may move malformed JSON before a repair issue can reach disk. Its
+    retained corrupt artifact must therefore prevent allocating a new identity
+    even when both entry data and the repair notice were lost in that crash.
+    """
+    if os.path.lexists(path):
+        return True
+    directory, filename = os.path.split(path)
+    try:
+        with os.scandir(directory) as entries:
+            return any(
+                item.name.startswith(f"{filename}.corrupt.") and os.path.lexists(item.path)
+                for item in entries
+            )
+    except FileNotFoundError:
+        return False
+
+
+async def _migration_identity(
+    hass: HomeAssistant, entry: ConfigEntry, *, required: bool = True
+) -> str | None:
     """Keep a private durable identity checkpoint across delayed entry saves.
 
     Retained after success for rollback/recovery: HA has no public synchronous
@@ -217,7 +284,28 @@ async def _migration_identity(hass: HomeAssistant, entry: ConfigEntry) -> str:
 
     if hass.state in (CoreState.stopping, CoreState.final_write):
         raise LedgerRepairError
-    checkpoint = await store(read_only=True).async_load()
+    checkpoint_store = store(read_only=True)
+    # Store can rename malformed JSON and return None, even in read-only mode.
+    # Inspect existence first, never reading checkpoint content outside Store.
+    existed = await hass.async_add_executor_job(
+        _checkpoint_or_corrupt_artifact_exists, checkpoint_store.path
+    )
+    checkpoint = await checkpoint_store.async_load()
+    corruption_id = f"checkpoint_corrupt_{entry.entry_id}"
+    prior_corruption = ir.async_get(hass).async_get_issue(DOMAIN, corruption_id)
+    if checkpoint is None and (existed or prior_corruption is not None):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            corruption_id,
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="ledger_repair",
+        )
+        raise LedgerRepairError
+    if checkpoint is None and not required and "migration_rename_all" not in entry.data:
+        return None
     entry_id = entry.data.get("public_id")
     if entry_id is not None:
         validate(entry_id)
@@ -236,7 +324,32 @@ async def _migration_identity(hass: HomeAssistant, entry: ConfigEntry) -> str:
         CoreState.final_write,
     ):
         raise LedgerRepairError
+    ir.async_delete_issue(hass, DOMAIN, corruption_id)
     return public_id
+
+
+async def async_recover_migration(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Recheck retained migration work before runtime on every startup.
+
+    Config-entry versions can reach disk before delayed registry saves. Task 10
+    must retain this guard before client, coordinator, and entity setup. Fresh
+    v2 entries without a migration checkpoint/marker require no registry work.
+    """
+    public_id = entry.entry_id
+    try:
+        identity = await _migration_identity(hass, entry, required=False)
+        if identity is None:
+            return True
+        public_id = identity
+        if entry.data.get("public_id") != public_id or entry.unique_id != public_id:
+            raise LedgerRepairError
+        _migrate_registries(hass, entry, public_id, recovery=True)
+    except Exception:
+        _migration_issue(hass, public_id, "ledger_repair")
+        return False
+    ir.async_delete_issue(hass, DOMAIN, f"ledger_repair_{public_id}")
+    ir.async_delete_issue(hass, DOMAIN, f"ledger_repair_{entry.entry_id}")
+    return True
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -247,7 +360,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return True
     public_id = entry.entry_id  # Value-free repair identity until checkpoint validation.
     try:
-        public_id = await _migration_identity(hass, entry)
+        identity = await _migration_identity(hass, entry)
+        assert identity is not None
+        public_id = identity
         hass.config_entries.async_update_entry(
             entry,
             data={
