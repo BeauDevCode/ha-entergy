@@ -257,7 +257,7 @@ paho-mqtt==2.1.0 ; python_full_version < '3.15'
     # via pytest-homeassistant-custom-component
 pathspec==1.1.1 ; python_full_version < '3.15'
     # via mypy
-pillow==12.3.0 ; python_full_version < '3.15'
+pillow==13.0.0 ; python_full_version < '3.15'
     # via homeassistant
 pip==26.2.1 ; python_full_version < '3.15'
     # via
