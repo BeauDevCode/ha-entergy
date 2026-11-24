@@ -228,7 +228,7 @@ mdurl==0.1.2 ; python_full_version < '3.15'
     # via markdown-it-py
 mock-open==1.4.0 ; python_full_version < '3.15'
     # via pytest-homeassistant-custom-component
-msgpack==1.2.2 ; python_full_version < '3.15'
+msgpack==1.2.3 ; python_full_version < '3.15'
     # via cachecontrol
 multidict==6.9.1 ; python_full_version < '3.15'
     # via
